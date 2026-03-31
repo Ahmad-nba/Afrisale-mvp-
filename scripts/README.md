@@ -2,6 +2,8 @@
 
 ## Feature tests
 
+- **`seed_test_products.py`** — Adds two sample rows (Black T-Shirt, Denim Jeans) to the DB from `.env`; skips names that already exist.
+- **`read_local_db_catalog.py`** — Prints the live catalog for your configured `DATABASE_URL`.
 - **`database_read_write_test.py`** — Verifies SQLAlchemy models, `add_product`, and `memory_service` last-five ordering using a temporary SQLite file.
 - **`agent_test.py`** — Calls `run_turn` once against Gemini; requires `GOOGLE_API_KEY`. Exits with skip message if the key is missing.
 

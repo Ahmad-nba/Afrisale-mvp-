@@ -34,12 +34,16 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 | Script | Purpose |
 |--------|---------|
 | [`scripts/database_read_write_test.py`](scripts/database_read_write_test.py) | DB + memory_service checks (no API key) |
+| [`scripts/seed_test_products.py`](scripts/seed_test_products.py) | Inserts two sample products into local SQLite (idempotent) |
+| [`scripts/read_local_db_catalog.py`](scripts/read_local_db_catalog.py) | Prints catalog from `DATABASE_URL` (no Gemini) |
 | [`scripts/agent_test.py`](scripts/agent_test.py) | One Gemini turn (needs `GOOGLE_API_KEY`) |
 | [`scripts/_w.py`](scripts/_w.py) … [`scripts/_w10.py`](scripts/_w10.py) | Historical scaffold writers that generated early files; **re-running overwrites targets** — see [`scripts/README.md`](scripts/README.md) |
 
 Run feature tests from the repo root:
 
 ```bash
+python scripts/seed_test_products.py
+python scripts/read_local_db_catalog.py
 python scripts/database_read_write_test.py
 python scripts/agent_test.py
 ```
