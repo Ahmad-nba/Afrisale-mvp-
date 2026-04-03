@@ -26,6 +26,9 @@ def _twilio_from_to_e164(from_field: str | None) -> str:
 def health() -> dict:
     return {"status": "ok"}
 
+@router.get("/webhook/health")
+def test_webhook():
+    return {"message": "GET works"}
 
 @router.post("/webhook")
 def webhook_json(body: WebhookPayload, db: Session = Depends(get_db)) -> dict:
