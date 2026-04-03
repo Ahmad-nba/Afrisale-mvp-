@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -36,7 +37,32 @@ def save_message(db: Session, customer_id: int, text: str, direction: str) -> No
     db.commit()
 
 
-def handle_inbound(db: Session, from_phone: str, text: str) -> str:
+def _deliver_outbound(
+    to_e164: str,
+    message: str,
+    *,
+    outbound_send: Callable[[str, str], None] | None,
+) -> None:
+    to_norm = normalize_phone(to_e164)
+    if outbound_send:
+        try:
+            outbound_send(to_norm, message)
+        except Exception:
+            logger.exception("outbound_send failed")
+        return
+    try:
+        africastalking.send_sms(to_norm, message)
+    except Exception:
+        logger.exception("send_sms failed")
+
+
+def handle_inbound(
+    db: Session,
+    from_phone: str,
+    text: str,
+    *,
+    outbound_send: Callable[[str, str], None] | None = None,
+) -> str:
     customer = get_or_create_customer(db, from_phone)
     raw_in = (text or "").strip()
 
@@ -46,10 +72,7 @@ def handle_inbound(db: Session, from_phone: str, text: str) -> str:
     if not ok:
         reply = detail
         save_message(db, customer.id, reply, "out")
-        try:
-            africastalking.send_sms(normalize_phone(from_phone), reply)
-        except Exception:
-            logger.exception("send_sms after input rejection")
+        _deliver_outbound(from_phone, reply, outbound_send=outbound_send)
         return reply
 
     role = (
@@ -66,8 +89,5 @@ def handle_inbound(db: Session, from_phone: str, text: str) -> str:
 
     safe_reply = output_guardrails.validate_assistant_text(db, raw_reply)
     save_message(db, customer.id, safe_reply, "out")
-    try:
-        africastalking.send_sms(normalize_phone(from_phone), safe_reply)
-    except Exception:
-        logger.exception("send_sms after reply")
+    _deliver_outbound(from_phone, safe_reply, outbound_send=outbound_send)
     return safe_reply

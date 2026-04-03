@@ -5,8 +5,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     database_url: str = "sqlite:///./afrisale.db"
-    google_api_key: str = "GOOGLE_API_KEY"
+    google_api_key: str = ""
     owner_phone: str = ""
+
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+    twilio_whatsapp_from: str = "whatsapp:+14155238886"
 
     at_username: str = ""
     at_api_key: str = ""
