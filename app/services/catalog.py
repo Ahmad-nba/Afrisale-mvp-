@@ -1,7 +1,36 @@
+from typing import Any
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models.models import Product, ProductVariant
+
+
+def search_products(db: Session, query: str) -> list[dict[str, Any]]:
+    """
+    Substring match on product name/description (case-insensitive).
+    Returns rows for agent UI: title, price, variant_id, product_id.
+    """
+    q = (query or "").strip().lower()
+    products = db.scalars(select(Product).order_by(Product.id)).all()
+    results: list[dict[str, Any]] = []
+    for p in products:
+        blob = f"{p.name} {p.description}".lower()
+        if q and q not in blob:
+            continue
+        variants = db.scalars(
+            select(ProductVariant).where(ProductVariant.product_id == p.id).order_by(ProductVariant.id)
+        ).all()
+        for v in variants:
+            results.append(
+                {
+                    "title": f"{p.name} ({v.size}, {v.color})",
+                    "price": v.price,
+                    "variant_id": v.id,
+                    "product_id": p.id,
+                }
+            )
+    return results
 
 
 def get_products_formatted(db: Session) -> str:
