@@ -1,3 +1,6 @@
+import re
+
+
 class InputGuardrail:
     """
     Validates inbound message before it reaches the Parlant runtime.
@@ -10,4 +13,13 @@ class InputGuardrail:
         reason is empty string on valid.
         Checks: min/max length, not empty, basic intent signal.
         """
-        pass
+        s = (text or "").strip()
+        if not s:
+            return False, "empty_message"
+        if len(s) < 2:
+            return False, "too_short"
+        if len(s) > 1000:
+            return False, "too_long"
+        if not re.search(r"[A-Za-z]", s):
+            return False, "no_intent"
+        return True, ""
