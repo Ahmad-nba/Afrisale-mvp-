@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable
 
 from sqlalchemy.orm import Session
 
@@ -8,6 +9,30 @@ from app.parlant_agent import tool_registry as tool_registry_module
 
 
 logger = logging.getLogger(__name__)
+
+
+def _db_bound_tools(tools: list, db: Session) -> list:
+    """Bind db into each tool handler so engine can call handler(**kwargs)."""
+    bound: list = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            bound.append(tool)
+            continue
+        handler = tool.get("handler")
+        if not callable(handler):
+            bound.append(tool)
+            continue
+
+        def _make_bound(h: Callable):
+            def _bound_handler(**kwargs):
+                return h(db, **kwargs)
+
+            return _bound_handler
+
+        patched = dict(tool)
+        patched["handler"] = _make_bound(handler)
+        bound.append(patched)
+    return bound
 
 
 class AfrisaleSession:
@@ -44,6 +69,7 @@ class AfrisaleSession:
                 if is_customer
                 else tool_registry_module.build_owner_tools(db)
             )
+            tools = _db_bound_tools(tools, db)
             engine = engine_module.build_engine(self.role, tools, guidelines)
 
             turn_name = "run" + "_turn"
