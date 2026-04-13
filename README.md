@@ -26,8 +26,9 @@ Set at least `GOOGLE_API_KEY` and `OWNER_PHONE`. For local runs without sending 
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-- Health: `GET http://localhost:8000/health`
-- Webhook: `POST http://localhost:8000/webhook` with JSON body `{"from": "+2567XXXXXXX", "text": "hello"}`
+- Health: `GET http://localhost:8000/api/health`
+- Webhook (JSON): `POST http://localhost:8000/api/webhook` with JSON body `{"from": "+2567XXXXXXX", "text": "hello"}`
+- WhatsApp webhook: `POST http://localhost:8000/api/webhook/whatsapp`
 
 ## Scripts
 
