@@ -44,7 +44,7 @@ class OutputFormattingGuardrail:
         max_len = 1600
         if len(text) <= max_len:
             return text
-        chunk = text[:max_len]
+        chunk = text[: max_len - 1]
         last_boundary_end = -1
         for m in _SENTENCE_BOUNDARY_RE.finditer(chunk):
             last_boundary_end = m.end()
@@ -60,7 +60,7 @@ class OutputFormattingGuardrail:
         max_len = 160
         if len(text) <= max_len:
             return text
-        chunk = text[:max_len]
+        chunk = text[: max_len - 1]
         last_space = chunk.rfind(" ")
         if last_space > 0:
             return chunk[:last_space].rstrip() + "…"

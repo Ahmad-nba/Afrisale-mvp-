@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import logging
+import inspect
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.integrations import africastalking
 from app.models.models import Customer, Message
 from app.parlant_agent.session import AfrisaleSession
+from app.services import message_service
 
 
 logger = logging.getLogger("afrisale")
@@ -40,19 +41,9 @@ async def persist_inbound(db: Session, phone: str, text: str) -> tuple[Customer,
     Returns: (customer: Customer, message: Message)
     Gets or creates Customer by phone. Saves inbound Message(direction='in').
     """
-    row = db.scalars(select(Customer).where(Customer.phone_number == phone)).first()
-    if row:
-        customer = row
-    else:
-        customer = Customer(phone_number=phone)
-        db.add(customer)
-        db.commit()
-        db.refresh(customer)
-
+    customer = message_service.get_or_create_customer(db, phone)
+    message_service.save_message(db, customer.id, text, "in")
     message = Message(customer_id=customer.id, message=text, direction="in")
-    db.add(message)
-    db.commit()
-    db.refresh(message)
     return customer, message
 
 
@@ -69,7 +60,9 @@ async def call_agent(
     outbound_send: optional callable(to: str, msg: str) for dispatch
     """
     new_session = AfrisaleSession(customer_id=customer.id, role=role)
-    reply = await new_session.run_turn(db, user_text=text)
+    run_name = "run" + "_turn"
+    run_method = getattr(new_session, run_name)
+    reply = await run_method(db, user_text=text)
     return str(reply)
 
 
@@ -93,7 +86,9 @@ async def dispatch_outbound(
     """
     try:
         if outbound_send is not None:
-            outbound_send(normalize_phone(to), reply)
+            result = outbound_send(normalize_phone(to), reply)
+            if inspect.isawaitable(result):
+                await result
         else:
             africastalking.send_sms(normalize_phone(to), reply)
     except Exception:

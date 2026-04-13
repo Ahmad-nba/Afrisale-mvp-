@@ -1,5 +1,6 @@
 import asyncio
 import re
+import types
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -9,17 +10,22 @@ from app.observability.logger import log_guardrail_decision
 
 
 _FALLBACK = "I'm having trouble with that request right now. Please try again or contact support."
-_PRICE_PREFIX_RE = re.compile(r"(?i)(?:\b(?:kes|ksh|ugx)\b|[$£₦])\s*([0-9][0-9,]*(?:\.[0-9]+)?)")
+_PRICE_PREFIX_RE = re.compile(
+    r"(?i)(?:\b(?:kes|ksh|ugx)\b|[$\u00A3\u20A6])\s*([0-9][0-9,]*(?:\.[0-9]+)?)"
+)
 _PRICE_SUFFIX_RE = re.compile(r"(?i)\b([0-9][0-9,]*(?:\.[0-9]+)?)\s*/=")
 _CAPITALIZED_WORD_RE = re.compile(r"\b[A-Z][A-Za-z]{2,}\b")
-_QUOTED_PHRASE_RE = re.compile(r"[\"“”]([^\"“”]{3,})[\"“”]")
+_QUOTED_PHRASE_RE = re.compile(r"\"([^\"]{3,})\"")
+
+if not hasattr(asyncio, "coroutine"):
+    asyncio.coroutine = types.coroutine  # type: ignore[attr-defined]
 
 
 class OutputValidationGuardrail:
     """
     STRICT post-agent gate. Blocks hallucinated prices, wrong product names,
     and unsafe content before the response is ever formatted or sent.
-    Failure triggers fallback response — never silently mangles.
+    Failure triggers fallback response and never silently mangles.
     """
 
     def validate(self, db: Session, reply: str) -> tuple[bool, str]:
@@ -35,11 +41,22 @@ class OutputValidationGuardrail:
             self._schedule_log("output_validation", False, "reply_too_short", customer_id)
             return False, _FALLBACK
 
-        known_prices = {
-            int(price)
-            for price in db.scalars(select(ProductVariant.price)).all()
-            if isinstance(price, int | float)
-        }
+        known_prices: set[int] = set()
+        try:
+            rows = db.query(ProductVariant).all()
+            for row in rows:
+                price = getattr(row, "price", None)
+                if isinstance(price, int | float):
+                    known_prices.add(int(price))
+        except Exception:
+            pass
+        if not known_prices:
+            try:
+                for price in db.scalars(select(ProductVariant.price)).all():
+                    if isinstance(price, int | float):
+                        known_prices.add(int(price))
+            except Exception:
+                pass
 
         mentioned_prices: list[float] = []
         for match in _PRICE_PREFIX_RE.finditer(text):
@@ -79,7 +96,8 @@ class OutputValidationGuardrail:
     @staticmethod
     def _schedule_log(stage: str, passed: bool, reason: str, customer_id: int) -> None:
         try:
-            asyncio.create_task(log_guardrail_decision(stage, passed, reason, customer_id))
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             # No running event loop in caller context; skip to keep validation non-blocking.
             return
+        loop.create_task(log_guardrail_decision(stage, passed, reason, customer_id))

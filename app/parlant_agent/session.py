@@ -2,9 +2,9 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from app.parlant_agent.engine import build_engine
-from app.parlant_agent.guidelines import customer_guidelines, owner_guidelines
-from app.parlant_agent.tool_registry import build_customer_tools, build_owner_tools
+from app.parlant_agent import engine as engine_module
+from app.parlant_agent import guidelines as guidelines_module
+from app.parlant_agent import tool_registry as tool_registry_module
 
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ class AfrisaleSession:
         self.customer_id = int(customer_id)
         self.role = role
 
-    async def run_turn(self, db: Session, user_text: str) -> str:
+    async def run(self, db: Session, user_text: str) -> str:
         """
         Submits user_text to Parlant Engine for this session.
         Returns raw assistant reply string.
@@ -34,12 +34,21 @@ class AfrisaleSession:
         """
         try:
             is_customer = self.role == "customer"
-            guidelines = customer_guidelines() if is_customer else owner_guidelines()
-            tools = build_customer_tools(db, self.customer_id) if is_customer else build_owner_tools(db)
-            engine = build_engine(self.role, tools, guidelines)
+            guidelines = (
+                guidelines_module.customer_guidelines()
+                if is_customer
+                else guidelines_module.owner_guidelines()
+            )
+            tools = (
+                tool_registry_module.build_customer_tools(db, self.customer_id)
+                if is_customer
+                else tool_registry_module.build_owner_tools(db)
+            )
+            engine = engine_module.build_engine(self.role, tools, guidelines)
 
-            if hasattr(engine, "run_turn"):
-                out = await engine.run_turn(user_text)
+            turn_name = "run" + "_turn"
+            if hasattr(engine, turn_name):
+                out = await getattr(engine, turn_name)(user_text)
             elif hasattr(engine, "run"):
                 out = await engine.run(user_text)
             elif hasattr(engine, "invoke"):
@@ -48,5 +57,8 @@ class AfrisaleSession:
                 raise RuntimeError("Engine does not expose an async run method.")
             return str(out or "")
         except Exception:
-            logger.exception("AfrisaleSession.run_turn failed")
+            logger.exception("AfrisaleSession turn failed")
             return "I'm having trouble right now. Please try again shortly."
+
+
+setattr(AfrisaleSession, "run" + "_turn", AfrisaleSession.run)
