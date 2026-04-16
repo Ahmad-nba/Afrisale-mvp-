@@ -7,21 +7,25 @@ import re
 from typing import Any
 
 from app.core import config
+from app.observability import logger as obs_logger
+from app.parlant_agent.providers.gemini_provider import GeminiProvider
+from app.parlant_agent.providers.base import ProviderError
 
 
 @dataclass
 class LocalParlantEngine:
     """
-    Minimal async-compatible engine fallback used when the Parlant package
-    is unavailable or its constructor differs from expected shape.
+    Minimal async-compatible engine that calls Gemini directly.
+    Used when the Parlant package is unavailable.
     """
 
     role: str
     tools: list
     guidelines: list
     model_backend: str
-    api_key: str
-    model_name: str
+    provider: GeminiProvider
+    retry_attempts: int
+    retry_backoff_seconds: float
 
     def _build_prompt(self, user_text: str, tool_result: str = "") -> str:
         guideline_lines = []
@@ -61,21 +65,29 @@ class LocalParlantEngine:
                     mapped[name] = handler
         return mapped
 
-    async def _generate_with_retry(self, client, prompt: str) -> Any:
-        attempts = 3
+    async def _generate_with_retry(self, prompt: str, stage: str) -> str:
+        attempts = max(1, int(self.retry_attempts))
         for idx in range(attempts):
             try:
-                return await client.aio.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
+                obs_logger.fire_and_forget(
+                    obs_logger.log_provider_event(stage, "gemini", "attempt", f"attempt={idx + 1}/{attempts}")
                 )
-            except Exception as exc:
-                msg = str(exc).lower()
-                is_retryable = "503" in msg or "unavailable" in msg or "timeout" in msg
-                if idx == attempts - 1 or not is_retryable:
+                text = (await self.provider.generate(prompt)).strip()
+                obs_logger.fire_and_forget(
+                    obs_logger.log_provider_event(stage, "gemini", "success")
+                )
+                return text
+            except ProviderError as exc:
+                obs_logger.fire_and_forget(
+                    obs_logger.log_provider_event(
+                        stage, "gemini", "error",
+                        f"retryable={exc.retryable} status={exc.status_code} msg={exc.message[:120]}",
+                    )
+                )
+                if idx == attempts - 1 or not exc.retryable:
                     raise
-                await asyncio.sleep(0.8 * (idx + 1))
-        raise RuntimeError("LLM generation failed after retries.")
+                await asyncio.sleep(float(self.retry_backoff_seconds) * (idx + 1))
+        raise ProviderError(provider="gemini", message="Retries exhausted.", retryable=False)
 
     @staticmethod
     def _extract_json_block(text: str) -> dict[str, Any]:
@@ -97,9 +109,6 @@ class LocalParlantEngine:
             return {}
 
     async def run(self, user_text: str) -> str:
-        from google import genai
-
-        client = genai.Client(api_key=self.api_key)
         tools = self._tool_map()
         planner_prompt = (
             self._build_prompt(user_text)
@@ -111,8 +120,8 @@ class LocalParlantEngine:
             + "- If user asks for full listing, use get_catalog.\n"
             + "- If no tool is needed, set tool to null.\n"
         )
-        planner_resp = await self._generate_with_retry(client, planner_prompt)
-        plan = self._extract_json_block(getattr(planner_resp, "text", "") or "")
+        planner_text = await self._generate_with_retry(planner_prompt, stage="planner")
+        plan = self._extract_json_block(planner_text)
         selected_tool = plan.get("tool")
         args = plan.get("args") if isinstance(plan.get("args"), dict) else {}
 
@@ -141,7 +150,7 @@ class LocalParlantEngine:
 
         final_prompt = self._build_prompt(user_text, tool_result=tool_context)
         try:
-            response = await self._generate_with_retry(client, final_prompt)
+            text = await self._generate_with_retry(final_prompt, stage="final")
         except Exception:
             if isinstance(selected_tool, str) and selected_tool in tools:
                 return (
@@ -149,7 +158,6 @@ class LocalParlantEngine:
                     f"{tool_result_for_fallback or 'No tool output available.'}"
                 )
             raise
-        text = (getattr(response, "text", None) or "").strip()
         if text:
             return text
         return "I can help with products, orders, and store support. What do you need?"
@@ -161,14 +169,24 @@ class LocalParlantEngine:
 def build_engine(role: str, tools: list, guidelines: list):
     """
     Instantiates and returns a configured Parlant Engine for the given role.
-    role 'owner'    -> loads owner guidelines + owner tool set
-    role 'customer' -> loads customer guidelines + customer tool set
-    Gemini model is configured from settings.google_api_key.
-    Returns: ParlantEngine instance (or equivalent configured object)
+    Uses Gemini as the sole LLM provider.
     """
-    api_key = (config.settings.google_api_key or "").strip()
+    settings = config.settings
+
+    api_key = (settings.google_api_key or "").strip()
     if not api_key:
         raise EnvironmentError("GOOGLE_API_KEY must be set in environment.")
+
+    model = (settings.gemini_model or "").strip() or "gemini-2.5-flash"
+    timeout = float(settings.llm_timeout_seconds)
+    retry_attempts = int(settings.llm_retry_attempts)
+    retry_backoff = float(settings.llm_retry_backoff_seconds)
+
+    provider = GeminiProvider(
+        api_key=api_key,
+        model=model,
+        timeout_seconds=timeout,
+    )
 
     try:
         from parlant import Engine as ParlantEngine  # type: ignore
@@ -188,6 +206,7 @@ def build_engine(role: str, tools: list, guidelines: list):
             tools=tools,
             guidelines=guidelines,
             model_backend="gemini",
-            api_key=api_key,
-            model_name=(config.settings.gemini_model or "gemini-2.5-flash"),
+            provider=provider,
+            retry_attempts=retry_attempts,
+            retry_backoff_seconds=retry_backoff,
         )

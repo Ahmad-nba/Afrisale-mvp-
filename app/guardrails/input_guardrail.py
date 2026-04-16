@@ -16,10 +16,10 @@ class InputGuardrail:
         s = (text or "").strip()
         if not s:
             return False, "empty_message"
-        if len(s) < 2:
+        if len(s) < 1: #cause native user inputs like "k, y, u" are valid
             return False, "too_short"
         if len(s) > 1000:
             return False, "too_long"
-        if not re.search(r"[A-Za-z]", s):
+        if not re.search(r"[A-Za-z]", s): #also include figures 
             return False, "no_intent"
         return True, ""

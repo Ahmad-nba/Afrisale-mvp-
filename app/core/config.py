@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     at_base_url: str = "https://api.africastalking.com/version1/messaging"
 
     gemini_model: str = "gemini-2.5-flash"
+    llm_timeout_seconds: float = 30.0
+    llm_retry_attempts: int = 3
+    llm_retry_backoff_seconds: float = 0.8
 
     skip_sms_send: bool = False
 

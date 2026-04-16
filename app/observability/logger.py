@@ -62,3 +62,19 @@ async def log_final_response(customer_id: int, reply: str, channel: str) -> None
         channel,
         reply,
     )
+
+
+async def log_provider_event(
+    stage: str,
+    provider: str,
+    action: str,
+    detail: str = "",
+) -> None:
+    """Logs provider selection/retry/failover lifecycle events."""
+    logger.info(
+        "event=provider stage=%s provider=%s action=%s detail=%s",
+        stage,
+        provider,
+        action,
+        detail,
+    )
