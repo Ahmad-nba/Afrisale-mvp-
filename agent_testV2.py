@@ -61,7 +61,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ── project imports ────────────────────────────────────────────────────────
-from app.core.database import SessionLocal
+from app.core.database import Base, SessionLocal, engine
 from app.core.config import settings
 from app.guardrails.input_guardrail import InputGuardrail
 from app.guardrails.output_validation import OutputValidationGuardrail
@@ -617,6 +617,8 @@ async def main():
     role  = args.role
     debug = args.debug
 
+    # Ensure latest ORM tables exist for standalone harness runs.
+    Base.metadata.create_all(bind=engine)
     db = SessionLocal()
 
     try:

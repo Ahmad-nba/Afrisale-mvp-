@@ -26,3 +26,15 @@ def get_or_create_customer(db: Session, phone: str) -> Customer:
 def save_message(db: Session, customer_id: int, text: str, direction: str) -> None:
     db.add(Message(customer_id=customer_id, message=text, direction=direction))
     db.commit()
+
+
+def get_recent_messages(db: Session, customer_id: int, limit: int = 6) -> list[Message]:
+    safe_limit = max(1, int(limit))
+    rows = db.scalars(
+        select(Message)
+        .where(Message.customer_id == customer_id)
+        .order_by(Message.id.desc())
+        .limit(safe_limit)
+    ).all()
+    rows.reverse()
+    return list(rows)

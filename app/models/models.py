@@ -35,6 +35,10 @@ class Customer(Base):
 
     messages: Mapped[list["Message"]] = relationship(back_populates="customer")
     orders: Mapped[list["Order"]] = relationship(back_populates="customer")
+    conversation_state: Mapped["ConversationState | None"] = relationship(
+        back_populates="customer",
+        uselist=False,
+    )
 
 
 class Order(Base):
@@ -78,3 +82,17 @@ class CustomerEntity(Base):
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id"), nullable=False)
     key: Mapped[str] = mapped_column(String(128), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class ConversationState(Base):
+    __tablename__ = "conversation_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    customer_id: Mapped[int] = mapped_column(
+        ForeignKey("customers.id"),
+        nullable=False,
+        unique=True,
+    )
+    state_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+
+    customer: Mapped["Customer"] = relationship(back_populates="conversation_state")

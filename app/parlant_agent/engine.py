@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
@@ -26,6 +27,103 @@ class LocalParlantEngine:
     provider: GeminiProvider
     retry_attempts: int
     retry_backoff_seconds: float
+    recent_messages: list[dict[str, str]] = field(default_factory=list)
+    memory_state: dict[str, Any] = field(default_factory=dict)
+    save_state: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
+    def set_memory_context(
+        self,
+        recent_messages: list[dict[str, str]] | None = None,
+        memory_state: dict[str, Any] | None = None,
+        save_state: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        self.recent_messages = list(recent_messages or [])
+        self.memory_state = dict(memory_state or {})
+        self.save_state = save_state
+
+    @staticmethod
+    def _format_history(messages: list[dict[str, str]]) -> str:
+        if not messages:
+            return "- (no recent history)"
+        lines: list[str] = []
+        for item in messages[-6:]:
+            direction = str(item.get("direction", "")).strip().lower()
+            role = "User" if direction == "in" else "Assistant"
+            text = str(item.get("message", "")).strip()
+            if text:
+                lines.append(f"- {role}: {text}")
+        return "\n".join(lines) if lines else "- (no recent history)"
+
+    @staticmethod
+    def _extract_price(text: str) -> int | None:
+        matches = re.findall(r"(\d[\d,]{2,})", text or "")
+        if not matches:
+            return None
+        try:
+            return int(matches[-1].replace(",", ""))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _extract_delivery_location(text: str) -> str:
+        m = re.search(r"\b(?:to|at|deliver to)\s+([A-Za-z][A-Za-z\s\-]{1,40})", text or "", flags=re.I)
+        if not m:
+            return ""
+        return m.group(1).strip()
+
+    @staticmethod
+    def _mentions_reference(text: str) -> bool:
+        t = (text or "").lower()
+        markers = ("the black one", "the brown one", "the one", "that one", "same one", "black one", "brown one")
+        return any(marker in t for marker in markers)
+
+    @staticmethod
+    def _extract_color_hint(text: str) -> str:
+        t = (text or "").lower()
+        for color in ("black", "brown", "white", "blue", "red", "green"):
+            if color in t:
+                return color
+        return ""
+
+    def _resolve_followup_query(self, user_text: str, state: dict[str, Any]) -> str:
+        candidates = state.get("lastProductCandidates")
+        if not isinstance(candidates, list) or not candidates:
+            return (user_text or "").strip()
+        if not self._mentions_reference(user_text):
+            return (user_text or "").strip()
+
+        hinted_price = self._extract_price(user_text)
+        color_hint = self._extract_color_hint(user_text)
+
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            score = 0
+            title = str(item.get("title", "")).lower()
+            price = int(item.get("price", 0) or 0)
+            if color_hint and color_hint in title:
+                score += 2
+            if hinted_price and hinted_price == price:
+                score += 2
+            scored.append((score, item))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        top = scored[0][1] if scored else candidates[0]
+        title = str(top.get("title", "")).strip()
+        if title:
+            return title
+        return (user_text or "").strip()
+
+    def _persist_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        if callable(self.save_state):
+            try:
+                self.memory_state = dict(self.save_state(state))
+                return self.memory_state
+            except Exception:
+                self.memory_state = dict(state)
+                return self.memory_state
+        self.memory_state = dict(state)
+        return self.memory_state
 
     def _build_prompt(self, user_text: str, tool_result: str = "") -> str:
         guideline_lines = []
@@ -43,10 +141,16 @@ class LocalParlantEngine:
             except Exception:
                 params_str = "{}"
             tools_summary.append(f"- {name}: {desc} | params={params_str}")
+        memory_state_str = json.dumps(self.memory_state or {}, ensure_ascii=True, default=str)
+        history = self._format_history(self.recent_messages or [])
         prompt = (
             f"You are Afrisale assistant for role={self.role}.\n"
             "Follow these guidelines strictly:\n"
             f"{chr(10).join(guideline_lines) if guideline_lines else '- (no guidelines provided)'}\n\n"
+            "Recent conversation history (oldest to newest):\n"
+            f"{history}\n\n"
+            "Structured memory slots:\n"
+            f"{memory_state_str}\n\n"
             "Available tools:\n"
             f"{chr(10).join(tools_summary) if tools_summary else '- (no tools provided)'}\n\n"
             f"User message:\n{(user_text or '').strip()}\n\n"
@@ -110,6 +214,15 @@ class LocalParlantEngine:
 
     async def run(self, user_text: str) -> str:
         tools = self._tool_map()
+        state = dict(self.memory_state or {})
+        extracted_price = self._extract_price(user_text)
+        if extracted_price:
+            state["lastMentionedPrice"] = extracted_price
+        maybe_location = self._extract_delivery_location(user_text)
+        if maybe_location:
+            state["deliveryLocation"] = maybe_location
+        self._persist_state(state)
+
         planner_prompt = (
             self._build_prompt(user_text)
             + "\n\nDecide whether a tool call is needed.\n"
@@ -124,12 +237,39 @@ class LocalParlantEngine:
         plan = self._extract_json_block(planner_text)
         selected_tool = plan.get("tool")
         args = plan.get("args") if isinstance(plan.get("args"), dict) else {}
+        if isinstance(selected_tool, str) and selected_tool == "search_products":
+            query = str(args.get("query", "")).strip()
+            if not query or self._mentions_reference(query):
+                args["query"] = self._resolve_followup_query(user_text, self.memory_state)
+        if isinstance(selected_tool, str) and selected_tool == "create_order":
+            if not args.get("delivery_location"):
+                fallback_location = str(self.memory_state.get("deliveryLocation", "")).strip()
+                if fallback_location:
+                    args["delivery_location"] = fallback_location
+            items = args.get("items")
+            if (not isinstance(items, list) or not items) and self.memory_state.get("selectedVariantId"):
+                args["items"] = [
+                    {
+                        "variant_id": int(self.memory_state["selectedVariantId"]),
+                        "quantity": 1,
+                    }
+                ]
 
         tool_context = ""
         tool_result_for_fallback = ""
         if isinstance(selected_tool, str) and selected_tool in tools:
             try:
                 tool_result = tools[selected_tool](**args)
+                try:
+                    from app.parlant_agent import tool_registry as tool_registry_module
+
+                    update = tool_registry_module.derive_memory_update(selected_tool, args, tool_result)
+                    if update:
+                        new_state = dict(self.memory_state or {})
+                        new_state.update(update)
+                        self._persist_state(new_state)
+                except Exception:
+                    pass
                 tool_result_for_fallback = json.dumps(tool_result, ensure_ascii=True, default=str)
                 tool_context = (
                     "\nTool execution:\n"

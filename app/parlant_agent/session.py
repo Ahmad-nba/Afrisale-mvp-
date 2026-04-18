@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.parlant_agent import engine as engine_module
 from app.parlant_agent import guidelines as guidelines_module
 from app.parlant_agent import tool_registry as tool_registry_module
+from app.services import conversation_state_service, message_service
 
 
 logger = logging.getLogger(__name__)
@@ -69,8 +70,24 @@ class AfrisaleSession:
                 if is_customer
                 else tool_registry_module.build_owner_tools(db)
             )
+            recent_rows = message_service.get_recent_messages(db, self.customer_id, limit=6)
+            recent_messages = [
+                {"direction": m.direction, "message": m.message}
+                for m in recent_rows
+            ]
+            memory_state = conversation_state_service.get_state(db, self.customer_id)
             tools = _db_bound_tools(tools, db)
             engine = engine_module.build_engine(self.role, tools, guidelines)
+            if hasattr(engine, "set_memory_context"):
+                engine.set_memory_context(
+                    recent_messages=recent_messages,
+                    memory_state=memory_state,
+                    save_state=lambda state: conversation_state_service.save_state(
+                        db,
+                        self.customer_id,
+                        state,
+                    ),
+                )
 
             turn_name = "run" + "_turn"
             if hasattr(engine, turn_name):

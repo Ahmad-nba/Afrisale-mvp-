@@ -3,6 +3,46 @@ from sqlalchemy.orm import Session
 from app.services import catalog, orders
 
 
+def derive_memory_update(tool_name: str, args: dict, tool_result) -> dict:
+    update: dict = {}
+    if tool_name == "search_products":
+        rows = tool_result if isinstance(tool_result, list) else []
+        candidates = []
+        for row in rows[:8]:
+            if not isinstance(row, dict):
+                continue
+            candidates.append(
+                {
+                    "title": str(row.get("title", "")),
+                    "price": int(row.get("price", 0) or 0),
+                    "variant_id": row.get("variant_id"),
+                    "product_id": row.get("product_id"),
+                }
+            )
+        update["lastProductCandidates"] = candidates
+        if candidates:
+            first = candidates[0]
+            update["selectedVariantId"] = first.get("variant_id")
+            update["selectedProductId"] = first.get("product_id")
+            update["lastMentionedPrice"] = first.get("price")
+        return update
+
+    if tool_name == "create_order":
+        if isinstance(args, dict):
+            location = str(args.get("delivery_location", "")).strip()
+            if location:
+                update["deliveryLocation"] = location
+            items = args.get("items")
+            if isinstance(items, list) and items:
+                first = items[0] if isinstance(items[0], dict) else {}
+                variant_id = first.get("variant_id", first.get("product_id"))
+                if variant_id is not None:
+                    update["selectedVariantId"] = int(variant_id)
+        return update
+
+    return update
+
+
 def _tool(
     name: str,
     description: str,
