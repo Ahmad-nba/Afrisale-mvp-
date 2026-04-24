@@ -1,9 +1,10 @@
 """
-Single Gemini invoke + tools path (requires GOOGLE_API_KEY).
+Single Gemini invoke + tools path (requires GCP_PROJECT_ID + ADC).
 Run from repo root: python scripts/agent_test.py
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -21,14 +22,14 @@ os.close(_fd)
 os.environ["DATABASE_URL"] = "sqlite:///" + _db_path.replace("\\", "/")
 os.environ.setdefault("SKIP_SMS_SEND", "true")
 
-if not os.environ.get("GOOGLE_API_KEY"):
-    print("SKIP agent_test: set GOOGLE_API_KEY in environment or .env at repo root")
+if not os.environ.get("GCP_PROJECT_ID"):
+    print("SKIP agent_test: set GCP_PROJECT_ID in environment or .env at repo root")
     sys.exit(0)
 
-from app.agents.agents import run_turn  # noqa: E402
 from app.core.database import Base, SessionLocal, engine  # noqa: E402
 import app.models.models  # noqa: E402, F401
 from app.models.models import Customer  # noqa: E402
+from app.parlant_agent.session import AfrisaleSession  # noqa: E402
 from app.services import catalog  # noqa: E402
 
 
@@ -44,7 +45,7 @@ def main() -> None:
     db.commit()
     db.refresh(c)
 
-    out = run_turn(db, "customer", c.id, "Please list all products using the catalog tool.")
+    out = asyncio.run(AfrisaleSession(c.id, "customer").run_turn(db, "Please list all products using the catalog tool."))
     db.close()
 
     assert out and len(out) > 5, f"unexpected short reply: {out!r}"

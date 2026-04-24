@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, field
 import json
+import os
 import re
 from typing import Any
 
@@ -309,21 +310,26 @@ class LocalParlantEngine:
 def build_engine(role: str, tools: list, guidelines: list):
     """
     Instantiates and returns a configured Parlant Engine for the given role.
-    Uses Gemini as the sole LLM provider.
+    Uses Gemini through Vertex AI (GCP) as the sole LLM provider.
     """
     settings = config.settings
 
-    api_key = (settings.google_api_key or "").strip()
-    if not api_key:
-        raise EnvironmentError("GOOGLE_API_KEY must be set in environment.")
+    project_id = (settings.gcp_project_id or "").strip()
+    if not project_id:
+        raise EnvironmentError("GCP_PROJECT_ID must be set in environment.")
+    location = (settings.gcp_location or "").strip() or "us-central1"
+    credentials_path = (settings.google_application_credentials or "").strip()
+    if credentials_path:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
 
-    model = (settings.gemini_model or "").strip() or "gemini-2.5-flash"
+    model = (settings.gcp_model or settings.gemini_model or "").strip() or "gemini-2.5-flash"
     timeout = float(settings.llm_timeout_seconds)
     retry_attempts = int(settings.llm_retry_attempts)
     retry_backoff = float(settings.llm_retry_backoff_seconds)
 
     provider = GeminiProvider(
-        api_key=api_key,
+        project_id=project_id,
+        location=location,
         model=model,
         timeout_seconds=timeout,
     )
@@ -334,7 +340,8 @@ def build_engine(role: str, tools: list, guidelines: list):
         return ParlantEngine(
             model={
                 "provider": "gemini",
-                "api_key": api_key,
+                "project": project_id,
+                "location": location,
             },
             tools=tools,
             guidelines=guidelines,

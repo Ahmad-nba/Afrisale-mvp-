@@ -8,3 +8,4 @@ twilio>=9.0.0
 parlant
 rapidfuzz>=3.0.0
 google-cloud-aiplatform>=1.148.1
+google-genai>=1.68.0

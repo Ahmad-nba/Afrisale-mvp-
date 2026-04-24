@@ -8,18 +8,23 @@ from app.parlant_agent.providers.base import ProviderError
 class GeminiProvider:
     name = "gemini"
 
-    def __init__(self, *, api_key: str, model: str, timeout_seconds: float) -> None:
-        self.api_key = (api_key or "").strip()
+    def __init__(self, *, project_id: str, location: str, model: str, timeout_seconds: float) -> None:
+        self.project_id = (project_id or "").strip()
+        self.location = (location or "").strip() or "us-central1"
         self.model = (model or "").strip()
         self.timeout_seconds = float(timeout_seconds)
 
     async def generate(self, prompt: str) -> str:
-        if not self.api_key:
-            raise ProviderError(provider=self.name, message="Missing API key.", retryable=False)
+        if not self.project_id:
+            raise ProviderError(provider=self.name, message="Missing GCP project ID.", retryable=False)
 
         from google import genai
 
-        client = genai.Client(api_key=self.api_key)
+        client = genai.Client(
+            vertexai=True,
+            project=self.project_id,
+            location=self.location,
+        )
         try:
             response = await asyncio.wait_for(
                 client.aio.models.generate_content(

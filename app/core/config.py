@@ -6,6 +6,10 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite:///./afrisale.db"
     google_api_key: str = ""
+    gcp_project_id: str = ""
+    gcp_location: str = "us-central1"
+    gcp_model: str = "gemini-2.5-flash"
+    google_application_credentials: str = ""
     owner_phone: str = ""
 
     twilio_account_sid: str = ""
