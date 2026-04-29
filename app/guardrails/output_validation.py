@@ -28,16 +28,20 @@ class OutputValidationGuardrail:
     Failure triggers fallback response and never silently mangles.
     """
 
-    def validate(self, db: Session, reply: str) -> tuple[bool, str]:
+    def validate(self, db: Session, reply: str, has_media: bool = False) -> tuple[bool, str]:
         """
         Returns: (is_valid: bool, safe_fallback_or_empty: str)
         If invalid: safe_fallback_or_empty contains the fallback message to send.
         If valid: safe_fallback_or_empty is empty string.
+
+        When `has_media` is true the response will be sent as an image card
+        with a short caption, so the "reply too short" rule is relaxed.
         """
         text = (reply or "").strip()
         customer_id = int(db.info.get("customer_id", -1)) if hasattr(db, "info") else -1
 
-        if len(text) < 5:
+        min_len = 1 if has_media else 5
+        if len(text) < min_len:
             self._schedule_log("output_validation", False, "reply_too_short", customer_id)
             return False, _FALLBACK
 

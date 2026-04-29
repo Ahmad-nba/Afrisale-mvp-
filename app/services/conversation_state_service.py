@@ -15,6 +15,8 @@ DEFAULT_STATE: dict[str, Any] = {
     "selectedVariantId": None,
     "lastMentionedPrice": None,
     "deliveryLocation": "",
+    "lastInboundAttachments": [],
+    "lastImageSearchMatches": [],
 }
 
 

@@ -28,5 +28,20 @@ class Settings(BaseSettings):
 
     skip_sms_send: bool = False
 
+    gcs_bucket_products: str = ""
+    gcs_signed_url_ttl_seconds: int = 60 * 60 * 24
+
+    vertex_vector_index_id: str = ""
+    vertex_vector_index_endpoint_id: str = ""
+    vertex_vector_deployed_index_id: str = ""
+    vertex_vector_dimensions: int = 1408
+    vertex_embedding_model: str = "multimodalembedding@001"
+
+    image_max_bytes: int = 10 * 1024 * 1024
+    image_allowed_mimes: str = "image/jpeg,image/png,image/webp,image/heic,image/heif"
+
+    image_match_min_similarity: float = 0.55
+    image_match_top_k: int = 4
+
 
 settings = Settings()

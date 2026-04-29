@@ -14,16 +14,21 @@ class OutputFormattingGuardrail:
     Runs ONLY after OutputValidationGuardrail passes.
     """
 
-    def format(self, reply: str, channel: str = "whatsapp") -> str:
+    def format(self, reply: str, channel: str = "whatsapp", as_caption: bool = False) -> str:
         """
         channel: 'whatsapp' | 'sms'
         Applies: WhatsApp markdown, length limits per channel,
         line break normalisation, strips internal chain-of-thought tokens.
+
+        When `as_caption` is true the WhatsApp caption limit (1024 chars)
+        applies, since Twilio attaches the body to a media message.
         """
         text = self._normalize_common(reply or "")
         if channel.lower() == "sms":
             text = self._strip_markdown(text)
             return self._truncate_sms(text)
+        if as_caption:
+            return self._truncate_caption(text)
         return self._truncate_whatsapp(text)
 
     @staticmethod
@@ -61,6 +66,22 @@ class OutputFormattingGuardrail:
         if len(text) <= max_len:
             return text
         chunk = text[: max_len - 1]
+        last_space = chunk.rfind(" ")
+        if last_space > 0:
+            return chunk[:last_space].rstrip() + "…"
+        return chunk.rstrip() + "…"
+
+    @staticmethod
+    def _truncate_caption(text: str) -> str:
+        max_len = 1024
+        if len(text) <= max_len:
+            return text
+        chunk = text[: max_len - 1]
+        last_boundary_end = -1
+        for m in _SENTENCE_BOUNDARY_RE.finditer(chunk):
+            last_boundary_end = m.end()
+        if last_boundary_end > 0:
+            return chunk[:last_boundary_end].rstrip() + "…"
         last_space = chunk.rfind(" ")
         if last_space > 0:
             return chunk[:last_space].rstrip() + "…"

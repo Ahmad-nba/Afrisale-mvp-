@@ -31,6 +31,8 @@ class LocalParlantEngine:
     recent_messages: list[dict[str, str]] = field(default_factory=list)
     memory_state: dict[str, Any] = field(default_factory=dict)
     save_state: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    _media_artifacts: dict[str, Any] = field(default_factory=dict)
 
     def set_memory_context(
         self,
@@ -41,6 +43,19 @@ class LocalParlantEngine:
         self.recent_messages = list(recent_messages or [])
         self.memory_state = dict(memory_state or {})
         self.save_state = save_state
+
+    def set_attachments(self, attachments: list[dict[str, Any]] | None = None) -> None:
+        self.attachments = list(attachments or [])
+
+    def consume_media_artifacts(self) -> dict[str, Any]:
+        """
+        Returns and clears the media artifacts captured during the last turn:
+            { "media_url": str, "alternates_text": str, "matches": list }
+        Called by the session after `run_turn` to drive WhatsApp media dispatch.
+        """
+        artifacts = dict(self._media_artifacts)
+        self._media_artifacts = {}
+        return artifacts
 
     @staticmethod
     def _format_history(messages: list[dict[str, str]]) -> str:
@@ -126,6 +141,19 @@ class LocalParlantEngine:
         self.memory_state = dict(state)
         return self.memory_state
 
+    def _format_attachments(self) -> str:
+        if not self.attachments:
+            return "- (no attachments)"
+        lines: list[str] = []
+        for item in self.attachments:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "")) or "unknown"
+            mime = str(item.get("mime_type", "")) or "unknown"
+            ident = item.get("id", "?")
+            lines.append(f"- attachment_id={ident} kind={kind} mime={mime}")
+        return "\n".join(lines) if lines else "- (no attachments)"
+
     def _build_prompt(self, user_text: str, tool_result: str = "") -> str:
         guideline_lines = []
         for g in self.guidelines:
@@ -144,6 +172,7 @@ class LocalParlantEngine:
             tools_summary.append(f"- {name}: {desc} | params={params_str}")
         memory_state_str = json.dumps(self.memory_state or {}, ensure_ascii=True, default=str)
         history = self._format_history(self.recent_messages or [])
+        attachments_block = self._format_attachments()
         prompt = (
             f"You are Afrisale assistant for role={self.role}.\n"
             "Follow these guidelines strictly:\n"
@@ -152,6 +181,8 @@ class LocalParlantEngine:
             f"{history}\n\n"
             "Structured memory slots:\n"
             f"{memory_state_str}\n\n"
+            "Inbound attachments on this turn:\n"
+            f"{attachments_block}\n\n"
             "Available tools:\n"
             f"{chr(10).join(tools_summary) if tools_summary else '- (no tools provided)'}\n\n"
             f"User message:\n{(user_text or '').strip()}\n\n"
@@ -213,6 +244,31 @@ class LocalParlantEngine:
         except Exception:
             return {}
 
+    @staticmethod
+    def _format_alternates(matches: list[dict[str, Any]]) -> str:
+        if not matches:
+            return ""
+        lines: list[str] = ["More options that look similar:"]
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            name = str(match.get("name", "")).strip() or "Product"
+            variants = match.get("variants") or []
+            price_str = ""
+            if variants:
+                first_variant = variants[0] if isinstance(variants[0], dict) else {}
+                price_val = first_variant.get("price")
+                if isinstance(price_val, (int, float)) and price_val:
+                    price_str = f" - {int(price_val)}"
+            lines.append(f"- {name}{price_str}")
+        return "\n".join(lines)
+
+    def _has_inbound_image(self) -> bool:
+        return any(
+            isinstance(a, dict) and str(a.get("kind", "")).lower() == "image"
+            for a in (self.attachments or [])
+        )
+
     async def run(self, user_text: str) -> str:
         tools = self._tool_map()
         state = dict(self.memory_state or {})
@@ -224,13 +280,16 @@ class LocalParlantEngine:
             state["deliveryLocation"] = maybe_location
         self._persist_state(state)
 
+        has_image = self._has_inbound_image()
         planner_prompt = (
             self._build_prompt(user_text)
             + "\n\nDecide whether a tool call is needed.\n"
             + "Return ONLY JSON with this schema:\n"
             + '{"tool": "<tool_name_or_null>", "args": {}}'
             + "\nRules:\n"
-            + "- If user is searching for products, prefer search_products.\n"
+            + "- If the inbound message has an image attachment, you MUST use find_products_by_image (no args needed; latest image is used).\n"
+            + "- If user is searching for products by description, prefer search_products.\n"
+            + "- For descriptive product queries (brand, color, material), prefer find_products_by_text.\n"
             + "- If user asks for full listing, use get_catalog.\n"
             + "- If no tool is needed, set tool to null.\n"
         )
@@ -238,6 +297,13 @@ class LocalParlantEngine:
         plan = self._extract_json_block(planner_text)
         selected_tool = plan.get("tool")
         args = plan.get("args") if isinstance(plan.get("args"), dict) else {}
+
+        # Hard override: if the user actually attached an image, force the
+        # image-search tool. Planner sometimes drifts even with rules above.
+        if has_image and "find_products_by_image" in tools:
+            selected_tool = "find_products_by_image"
+            args = {}
+
         if isinstance(selected_tool, str) and selected_tool == "search_products":
             query = str(args.get("query", "")).strip()
             if not query or self._mentions_reference(query):
@@ -258,6 +324,7 @@ class LocalParlantEngine:
 
         tool_context = ""
         tool_result_for_fallback = ""
+        captured_matches: list[dict[str, Any]] = []
         if isinstance(selected_tool, str) and selected_tool in tools:
             try:
                 tool_result = tools[selected_tool](**args)
@@ -271,13 +338,25 @@ class LocalParlantEngine:
                         self._persist_state(new_state)
                 except Exception:
                     pass
+
+                if selected_tool in (
+                    "find_products_by_image",
+                    "find_products_by_text",
+                    "search_products",
+                ) and isinstance(tool_result, list):
+                    captured_matches = [m for m in tool_result if isinstance(m, dict)]
+
                 tool_result_for_fallback = json.dumps(tool_result, ensure_ascii=True, default=str)
                 tool_context = (
                     "\nTool execution:\n"
                     f"- tool: {selected_tool}\n"
                     f"- args: {json.dumps(args, ensure_ascii=True)}\n"
                     f"- result: {tool_result_for_fallback}\n\n"
-                    "Use the tool result above when crafting your response."
+                    "Use the tool result above when crafting your response. "
+                    "If the result is a list of products, write a friendly WhatsApp-style reply "
+                    "that names the top match (with price + key variants). Do NOT invent "
+                    "products or prices outside the result. If the result is empty, say we "
+                    "do not have a match and offer to help search again."
                 )
             except Exception as exc:
                 tool_result_for_fallback = f"ERROR {exc}"
@@ -294,14 +373,35 @@ class LocalParlantEngine:
             text = await self._generate_with_retry(final_prompt, stage="final")
         except Exception:
             if isinstance(selected_tool, str) and selected_tool in tools:
+                self._capture_media_artifacts(captured_matches)
                 return (
                     "I used the requested catalog workflow and got this result:\n"
                     f"{tool_result_for_fallback or 'No tool output available.'}"
                 )
             raise
+
+        self._capture_media_artifacts(captured_matches)
         if text:
             return text
         return "I can help with products, orders, and store support. What do you need?"
+
+    def _capture_media_artifacts(self, matches: list[dict[str, Any]]) -> None:
+        """
+        Persist a `media_url` for the top match (if it has an image) plus a
+        short alternates text so the dispatch stage can render a WhatsApp
+        media card + follow-up text.
+        """
+        if not matches:
+            self._media_artifacts = {}
+            return
+        top = matches[0] if isinstance(matches[0], dict) else {}
+        media_url = str(top.get("image_url") or "")
+        alternates = self._format_alternates(matches[1:4])
+        self._media_artifacts = {
+            "media_url": media_url,
+            "alternates_text": alternates,
+            "matches": matches,
+        }
 
     async def invoke(self, user_text: str) -> str:
         return await self.run(user_text)

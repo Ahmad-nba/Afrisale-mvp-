@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -38,60 +39,65 @@ def _db_bound_tools(tools: list, db: Session) -> list:
 
 class AfrisaleSession:
     """
-    Thin wrapper around Parlant's session API.
+    Thin wrapper around the agent engine.
     Owns: conversation turn context ONLY.
     Does NOT own: customer records, order state, product catalog.
     Those live exclusively in SQLite and are accessed via tool calls.
     """
 
     def __init__(self, customer_id: int, role: str):
-        """
-        customer_id: FK into Customer table — used to scope session, not store data.
-        role: 'owner' | 'customer' — selects which guideline set to apply.
-        """
         self.customer_id = int(customer_id)
         self.role = role
 
-    async def run(self, db: Session, user_text: str) -> str:
-        """
-        Submits user_text to Parlant Engine for this session.
-        Returns raw assistant reply string.
-        Engine may call tools zero or more times before returning.
-        """
-        try:
-            is_customer = self.role == "customer"
-            guidelines = (
-                guidelines_module.customer_guidelines()
-                if is_customer
-                else guidelines_module.owner_guidelines()
-            )
-            tools = (
-                tool_registry_module.build_customer_tools(db, self.customer_id)
-                if is_customer
-                else tool_registry_module.build_owner_tools(db)
-            )
-            recent_rows = message_service.get_recent_messages(db, self.customer_id, limit=6)
-            recent_messages = [
-                {"direction": m.direction, "message": m.message}
-                for m in recent_rows
-            ]
-            memory_state = conversation_state_service.get_state(db, self.customer_id)
-            tools = _db_bound_tools(tools, db)
-            engine = engine_module.build_engine(self.role, tools, guidelines)
-            if hasattr(engine, "set_memory_context"):
-                engine.set_memory_context(
-                    recent_messages=recent_messages,
-                    memory_state=memory_state,
-                    save_state=lambda state: conversation_state_service.save_state(
-                        db,
-                        self.customer_id,
-                        state,
-                    ),
-                )
+    async def _build_engine_with_context(
+        self,
+        db: Session,
+        attachments: list[dict[str, Any]] | None = None,
+    ):
+        is_customer = self.role == "customer"
+        guidelines = (
+            guidelines_module.customer_guidelines()
+            if is_customer
+            else guidelines_module.owner_guidelines()
+        )
+        tools = (
+            tool_registry_module.build_customer_tools(db, self.customer_id, last_attachments=attachments)
+            if is_customer
+            else tool_registry_module.build_owner_tools(db, last_attachments=attachments)
+        )
 
-            turn_name = "run" + "_turn"
-            if hasattr(engine, turn_name):
-                out = await getattr(engine, turn_name)(user_text)
+        recent_rows = message_service.get_recent_messages(db, self.customer_id, limit=6)
+        recent_messages = [
+            {"direction": m.direction, "message": m.message}
+            for m in recent_rows
+        ]
+        memory_state = conversation_state_service.get_state(db, self.customer_id)
+        if attachments:
+            memory_state["lastInboundAttachments"] = list(attachments)
+
+        tools = _db_bound_tools(tools, db)
+        engine = engine_module.build_engine(self.role, tools, guidelines)
+        if hasattr(engine, "set_memory_context"):
+            engine.set_memory_context(
+                recent_messages=recent_messages,
+                memory_state=memory_state,
+                save_state=lambda state: conversation_state_service.save_state(
+                    db,
+                    self.customer_id,
+                    state,
+                ),
+            )
+        if hasattr(engine, "set_attachments"):
+            engine.set_attachments(list(attachments or []))
+        return engine
+
+    async def run(self, db: Session, user_text: str) -> str:
+        """Backwards-compatible text-only entry point."""
+        try:
+            engine = await self._build_engine_with_context(db, attachments=None)
+            run_name = "run" + "_turn"
+            if hasattr(engine, run_name):
+                out = await getattr(engine, run_name)(user_text)
             elif hasattr(engine, "run"):
                 out = await engine.run(user_text)
             elif hasattr(engine, "invoke"):
@@ -102,6 +108,49 @@ class AfrisaleSession:
         except Exception:
             logger.exception("AfrisaleSession turn failed")
             return "I'm having trouble right now. Please try again shortly."
+
+    async def run_turn_with_media(
+        self,
+        db: Session,
+        user_text: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, str, str, list[dict[str, Any]]]:
+        """
+        Runs a turn with optional inbound media context and returns:
+            (reply_text, media_url, alternates_text, matches)
+
+        media_url is the public URL of the top match's primary image (if any),
+        and alternates_text is a follow-up text listing other matches.
+        """
+        try:
+            engine = await self._build_engine_with_context(db, attachments=attachments)
+            run_name = "run" + "_turn"
+            if hasattr(engine, run_name):
+                out = await getattr(engine, run_name)(user_text)
+            elif hasattr(engine, "run"):
+                out = await engine.run(user_text)
+            elif hasattr(engine, "invoke"):
+                out = await engine.invoke(user_text)
+            else:
+                raise RuntimeError("Engine does not expose an async run method.")
+            reply = str(out or "")
+            media_url = ""
+            alternates = ""
+            matches: list[dict[str, Any]] = []
+            if hasattr(engine, "consume_media_artifacts"):
+                artifacts = engine.consume_media_artifacts()
+                media_url = str(artifacts.get("media_url", "") or "")
+                alternates = str(artifacts.get("alternates_text", "") or "")
+                matches = list(artifacts.get("matches") or [])
+            return reply, media_url, alternates, matches
+        except Exception:
+            logger.exception("AfrisaleSession media turn failed")
+            return (
+                "I'm having trouble right now. Please try again shortly.",
+                "",
+                "",
+                [],
+            )
 
 
 setattr(AfrisaleSession, "run" + "_turn", AfrisaleSession.run)

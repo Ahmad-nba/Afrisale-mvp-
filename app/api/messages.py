@@ -9,6 +9,7 @@ from app.core.database import get_db
 from app.integrations import twilio_whatsapp
 from app.pipeline.runner import run_pipeline
 from app.schemas.schemas import WebhookPayload
+from app.services import media_service
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ def test_webhook():
 
 @router.post("/webhook")
 async def webhook_json(payload: WebhookPayload, db: Session = Depends(get_db)) -> dict:
-    """JSON webhook (e.g. Africa's Talking style)."""
+    """JSON webhook (e.g. Africa's Talking style). No media support on this channel."""
     reply = await run_pipeline(
         db=db,
         from_raw=payload.from_,
@@ -41,13 +42,21 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)) -> P
     """
     Twilio inbound WhatsApp: application/x-www-form-urlencoded.
     Full URL: https://<host>/api/webhook/whatsapp
+
+    Inbound media (NumMedia, MediaUrl{N}, MediaContentType{N}) is parsed
+    here, downloaded by the pipeline, and surfaced to the agent so it can
+    run image-based product matching.
     """
     form = await request.form()
     form_snapshot = {key: form.get(key) for key in form.keys()}
 
-    print("🔥 WEBHOOK CALLED 🔥")
-    print(form_snapshot)
-    logger.info("whatsapp_webhook form keys=%s", list(form_snapshot.keys()))
+    logger.info(
+        "whatsapp_webhook keys=%s num_media=%s",
+        list(form_snapshot.keys()),
+        form_snapshot.get("NumMedia"),
+    )
+
+    attachments = media_service.parse_twilio_form_attachments(form_snapshot)
 
     reply = await run_pipeline(
         db=db,
@@ -55,6 +64,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)) -> P
         text_raw=str(form.get("Body", "")).strip(),
         owner_phone=settings.owner_phone,
         outbound_send=lambda to, msg: twilio_whatsapp.send_whatsapp(to, msg),
+        attachments=attachments,
     )
-    logger.info("whatsapp_webhook reply_len=%s", len(reply))
+    logger.info("whatsapp_webhook reply_len=%s media_in=%d", len(reply), len(attachments))
     return PlainTextResponse("OK", status_code=200)

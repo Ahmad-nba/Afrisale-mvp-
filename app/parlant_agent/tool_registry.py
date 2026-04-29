@@ -1,11 +1,11 @@
 from sqlalchemy.orm import Session
 
-from app.services import catalog, orders
+from app.services import catalog, catalog_image_ingest, orders, product_image_search
 
 
 def derive_memory_update(tool_name: str, args: dict, tool_result) -> dict:
     update: dict = {}
-    if tool_name == "search_products":
+    if tool_name in ("search_products", "find_products_by_text"):
         rows = tool_result if isinstance(tool_result, list) else []
         candidates = []
         for row in rows[:8]:
@@ -13,10 +13,11 @@ def derive_memory_update(tool_name: str, args: dict, tool_result) -> dict:
                 continue
             candidates.append(
                 {
-                    "title": str(row.get("title", "")),
+                    "title": str(row.get("title") or row.get("name") or ""),
                     "price": int(row.get("price", 0) or 0),
                     "variant_id": row.get("variant_id"),
                     "product_id": row.get("product_id"),
+                    "image_url": row.get("image_url", ""),
                 }
             )
         update["lastProductCandidates"] = candidates
@@ -25,6 +26,25 @@ def derive_memory_update(tool_name: str, args: dict, tool_result) -> dict:
             update["selectedVariantId"] = first.get("variant_id")
             update["selectedProductId"] = first.get("product_id")
             update["lastMentionedPrice"] = first.get("price")
+        return update
+
+    if tool_name == "find_products_by_image":
+        matches = tool_result if isinstance(tool_result, list) else []
+        slim = []
+        for match in matches[:8]:
+            if not isinstance(match, dict):
+                continue
+            slim.append(
+                {
+                    "product_id": match.get("product_id"),
+                    "name": match.get("name", ""),
+                    "image_url": match.get("image_url", ""),
+                    "similarity": float(match.get("similarity", 0.0)),
+                }
+            )
+        update["lastImageSearchMatches"] = slim
+        if slim:
+            update["selectedProductId"] = slim[0].get("product_id")
         return update
 
     if tool_name == "create_order":
@@ -57,20 +77,48 @@ def _tool(
     }
 
 
-def build_customer_tools(db: Session, customer_id: int) -> list:
+def build_customer_tools(
+    db: Session,
+    customer_id: int,
+    last_attachments: list[dict] | None = None,
+) -> list:
     """
-    Returns Parlant tool definitions for customer role:
-    - get_products_formatted(db) -> formatted catalog string
-    - search_products(db, query) -> list of matching products (new)
-    - create_order(db, customer_id, items) -> order confirmation
-    - get_order_status(db, customer_id, order_id) -> status string
+    Returns customer-role tool definitions.
+
+    `last_attachments` is the list of inbound attachments for the current turn,
+    so the image-search tool can pick up the latest image without the LLM
+    needing to know the attachment id.
     """
+    last_attachments = list(last_attachments or [])
+
     def handle_get_catalog(db: Session, **kwargs) -> str:
         return catalog.get_products_formatted(db)
 
     def handle_search_products(db: Session, **kwargs) -> list[dict]:
         query = str(kwargs.get("query", ""))
-        return catalog.search_products(db, query=query)
+        results = catalog.search_products(db, query=query)
+        if results:
+            return results
+        # Multimodal text fallback for descriptive queries ("Air Jordans").
+        return product_image_search.search_by_text(db, query=query)
+
+    def handle_find_products_by_text(db: Session, **kwargs) -> list[dict]:
+        query = str(kwargs.get("query", ""))
+        return product_image_search.search_by_text(db, query=query)
+
+    def handle_find_products_by_image(db: Session, **kwargs) -> list[dict]:
+        attachment_id = kwargs.get("attachment_id")
+        if attachment_id is None and last_attachments:
+            for descriptor in last_attachments:
+                if str(descriptor.get("kind", "")).lower() == "image":
+                    attachment_id = descriptor.get("id")
+                    break
+        if attachment_id is None:
+            return []
+        return product_image_search.search_by_image_attachment(
+            db,
+            attachment_id=int(attachment_id),
+        )
 
     def handle_create_order(db: Session, **kwargs) -> dict:
         delivery_location = str(kwargs.get("delivery_location", "")).strip()
@@ -112,7 +160,10 @@ def build_customer_tools(db: Session, customer_id: int) -> list:
         ),
         _tool(
             name="search_products",
-            description="Searches the catalog by keyword. Use this before get_catalog.",
+            description=(
+                "Searches the catalog by keyword. Falls back to multimodal text "
+                "embedding search when keyword search is empty."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -121,6 +172,39 @@ def build_customer_tools(db: Session, customer_id: int) -> list:
                 "required": ["query"],
             },
             handler=handle_search_products,
+        ),
+        _tool(
+            name="find_products_by_text",
+            description=(
+                "Multimodal text-to-image search. Use for descriptive product "
+                "queries such as 'red leather belt' or 'air jordans'."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                },
+                "required": ["query"],
+            },
+            handler=handle_find_products_by_text,
+        ),
+        _tool(
+            name="find_products_by_image",
+            description=(
+                "Finds catalog products visually similar to a user-supplied image. "
+                "Use this whenever the inbound message has an image attachment."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "attachment_id": {
+                        "type": "integer",
+                        "description": "Optional. If omitted the latest inbound image is used.",
+                    },
+                },
+                "required": [],
+            },
+            handler=handle_find_products_by_image,
         ),
         _tool(
             name="create_order",
@@ -162,14 +246,16 @@ def build_customer_tools(db: Session, customer_id: int) -> list:
     ]
 
 
-def build_owner_tools(db: Session) -> list:
+def build_owner_tools(
+    db: Session,
+    last_attachments: list[dict] | None = None,
+) -> list:
     """
-    Returns Parlant tool definitions for owner role:
-    - add_product(db, ...) -> product
-    - update_stock(db, product_id, qty) -> product
-    - update_price(db, product_id, price) -> product
-    - list_all_orders(db) -> formatted orders string
+    Returns owner-role tool definitions. Includes `add_product_image` so the
+    seller WhatsApp upload path (future) can register catalog images.
     """
+    last_attachments = list(last_attachments or [])
+
     def handle_add_product(db: Session, **kwargs) -> str:
         return catalog.add_product(
             db,
@@ -193,6 +279,31 @@ def build_owner_tools(db: Session) -> list:
 
     def handle_list_all_orders(db: Session, **kwargs) -> str:
         return orders.view_orders(db)
+
+    def handle_add_product_image(db: Session, **kwargs) -> str:
+        product_id = int(kwargs["product_id"])
+        attachment_id = kwargs.get("attachment_id")
+        if attachment_id is None and last_attachments:
+            for descriptor in last_attachments:
+                if str(descriptor.get("kind", "")).lower() == "image":
+                    attachment_id = descriptor.get("id")
+                    break
+        if attachment_id is None:
+            return "No image attachment found on this turn. Please attach an image."
+        is_primary = kwargs.get("is_primary")
+        try:
+            image = catalog_image_ingest.register_product_image_from_attachment(
+                db,
+                product_id=product_id,
+                attachment_id=int(attachment_id),
+                is_primary=is_primary,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not register product image: {exc}"
+        return (
+            f"Product image registered (product_id={product_id}, image_id={image.id}, "
+            f"primary={image.is_primary})."
+        )
 
     return [
         _tool(
@@ -239,5 +350,26 @@ def build_owner_tools(db: Session) -> list:
             description="Lists all recent orders in formatted text.",
             parameters={"type": "object", "properties": {}, "required": []},
             handler=handle_list_all_orders,
+        ),
+        _tool(
+            name="add_product_image",
+            description=(
+                "Registers an inbound image as a catalog image for a product. "
+                "Use after seller sends a product photo with text like "
+                "'add this image to product 5'."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "product_id": {"type": "integer"},
+                    "attachment_id": {
+                        "type": "integer",
+                        "description": "Optional; defaults to latest inbound image.",
+                    },
+                    "is_primary": {"type": "boolean"},
+                },
+                "required": ["product_id"],
+            },
+            handler=handle_add_product_image,
         ),
     ]

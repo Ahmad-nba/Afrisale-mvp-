@@ -1,18 +1,36 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass, field
 import logging
 import inspect
+from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.integrations import africastalking
+from app.integrations import africastalking, twilio_whatsapp
 from app.models.models import Customer, Message
 from app.parlant_agent.session import AfrisaleSession
-from app.services import message_service
+from app.services import media_service, message_service
 
 
 logger = logging.getLogger("afrisale")
+
+
+@dataclass
+class OutboundEnvelope:
+    """
+    Result of an agent turn that the dispatch stage knows how to send.
+
+    `text` is the primary message body. `media_url` is the public URL of the
+    top-match product image (if any). `alternates_text` is an optional second
+    text-only message listing additional matches.
+    """
+
+    text: str
+    media_url: str = ""
+    alternates_text: str = ""
+    matches: list[dict[str, Any]] = field(default_factory=list)
 
 
 def normalize_phone(raw: str) -> str:
@@ -36,15 +54,44 @@ async def normalize_inbound(from_raw: str, text_raw: str) -> dict[str, str]:
     return {"phone": phone, "text": (text_raw or "").strip()}
 
 
-async def persist_inbound(db: Session, phone: str, text: str) -> tuple[Customer, Message]:
+async def persist_inbound(
+    db: Session,
+    phone: str,
+    text: str,
+    *,
+    channel: str = "whatsapp",
+    has_attachments: bool = False,
+) -> tuple[Customer, Message]:
     """
-    Returns: (customer: Customer, message: Message)
-    Gets or creates Customer by phone. Saves inbound Message(direction='in').
+    Gets or creates Customer by phone. Saves inbound Message(direction='in')
+    and returns the persisted ORM row so attachments can FK to its id.
     """
     customer = message_service.get_or_create_customer(db, phone)
-    message_service.save_message(db, customer.id, text, "in")
-    message = Message(customer_id=customer.id, message=text, direction="in")
-    return customer, message
+    message_type = "media" if has_attachments and not text else (
+        "mixed" if has_attachments else "text"
+    )
+    msg = Message(
+        customer_id=customer.id,
+        message=text or "",
+        direction="in",
+        channel=channel,
+        message_type=message_type,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    return customer, msg
+
+
+async def persist_inbound_attachments(
+    db: Session,
+    message_id: int,
+    descriptors: list[media_service.InboundMediaDescriptor],
+) -> list[media_service.StoredAttachment]:
+    """Wraps media_service so the runner stays thin."""
+    if not descriptors:
+        return []
+    return media_service.ingest_inbound_attachments(db, message_id, descriptors)
 
 
 async def call_agent(
@@ -52,44 +99,83 @@ async def call_agent(
     customer: Customer,
     text: str,
     role: str,
-    outbound_send: Callable[[str, str], None] | None = None,
-) -> str:
+    outbound_send: Callable[..., None] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+) -> OutboundEnvelope:
     """
-    Calls Parlant runtime. Returns raw assistant reply string.
-    role: 'owner' | 'customer'
-    outbound_send: optional callable(to: str, msg: str) for dispatch
+    Calls the agent runtime and returns an OutboundEnvelope describing what
+    to send. The session may stash media_url and alternates on the engine
+    via shared memory; we read them back here.
     """
-    new_session = AfrisaleSession(customer_id=customer.id, role=role)
-    run_name = "run" + "_turn"
-    run_method = getattr(new_session, run_name)
-    reply = await run_method(db, user_text=text)
-    return str(reply)
+    session = AfrisaleSession(customer_id=customer.id, role=role)
+    reply, media_url, alternates, matches = await session.run_turn_with_media(
+        db,
+        user_text=text,
+        attachments=attachments or [],
+    )
+    return OutboundEnvelope(
+        text=str(reply or ""),
+        media_url=str(media_url or ""),
+        alternates_text=str(alternates or ""),
+        matches=list(matches or []),
+    )
 
 
-async def persist_outbound(db: Session, customer: Customer, reply: str) -> None:
-    """
-    Saves outbound Message(direction='out', content=reply) to DB.
-    """
-    message = Message(customer_id=customer.id, message=reply, direction="out")
+async def persist_outbound(
+    db: Session,
+    customer: Customer,
+    reply: str,
+    *,
+    channel: str = "whatsapp",
+    has_media: bool = False,
+) -> None:
+    """Saves outbound Message(direction='out', content=reply) to DB."""
+    message = Message(
+        customer_id=customer.id,
+        message=reply or "",
+        direction="out",
+        channel=channel,
+        message_type="media" if has_media else "text",
+    )
     db.add(message)
     db.commit()
 
 
 async def dispatch_outbound(
     to: str,
-    reply: str,
-    outbound_send: Callable[[str, str], None] | None = None,
+    envelope: OutboundEnvelope,
+    outbound_send: Callable[..., None] | None = None,
 ) -> None:
     """
-    Sends reply via outbound_send lambda if provided, else Africa's Talking SMS.
-    Logs send result. Never raises — catches and logs failures.
+    Sends the envelope through the WhatsApp/SMS path.
+
+    For WhatsApp, when an image url is present we send the top match as a
+    media message (image + caption), then optionally send the alternates as
+    a follow-up text message.
+
+    For SMS (no outbound_send), media is dropped to text only.
     """
+    to_e164 = normalize_phone(to)
     try:
-        if outbound_send is not None:
-            result = outbound_send(normalize_phone(to), reply)
-            if inspect.isawaitable(result):
-                await result
-        else:
-            africastalking.send_sms(normalize_phone(to), reply)
+        if outbound_send is None:
+            body = envelope.text
+            if envelope.alternates_text:
+                body = f"{body}\n\n{envelope.alternates_text}".strip()
+            africastalking.send_sms(to_e164, body)
+            return
+
+        if envelope.media_url:
+            twilio_whatsapp.send_whatsapp_media(
+                to_e164,
+                envelope.text,
+                envelope.media_url,
+            )
+            if envelope.alternates_text.strip():
+                twilio_whatsapp.send_whatsapp(to_e164, envelope.alternates_text.strip())
+            return
+
+        result = outbound_send(to_e164, envelope.text)
+        if inspect.isawaitable(result):
+            await result
     except Exception:
         logger.exception("dispatch_outbound_failed")

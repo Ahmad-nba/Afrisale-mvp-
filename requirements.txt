@@ -9,3 +9,4 @@ parlant
 rapidfuzz>=3.0.0
 google-cloud-aiplatform>=1.148.1
 google-genai>=1.68.0
+google-cloud-storage>=3.0.0

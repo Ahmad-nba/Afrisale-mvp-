@@ -7,8 +7,10 @@ from fastapi import FastAPI
 
 from app.api.messages import router
 from app.core.database import Base, engine
+from app.core.migrations import ensure_schema
 
 Base.metadata.create_all(bind=engine)
+ensure_schema(engine)
 
 app = FastAPI(title="Afrisale MVP")
 app.include_router(router, prefix="/api")
