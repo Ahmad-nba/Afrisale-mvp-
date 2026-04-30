@@ -28,7 +28,7 @@ def derive_memory_update(tool_name: str, args: dict, tool_result) -> dict:
             update["lastMentionedPrice"] = first.get("price")
         return update
 
-    if tool_name == "find_products_by_image":
+    if tool_name in ("find_products_by_image", "get_product_image"):
         matches = tool_result if isinstance(tool_result, list) else []
         slim = []
         for match in matches[:8]:
@@ -81,6 +81,7 @@ def build_customer_tools(
     db: Session,
     customer_id: int,
     last_attachments: list[dict] | None = None,
+    last_memory_state: dict | None = None,
 ) -> list:
     """
     Returns customer-role tool definitions.
@@ -88,8 +89,13 @@ def build_customer_tools(
     `last_attachments` is the list of inbound attachments for the current turn,
     so the image-search tool can pick up the latest image without the LLM
     needing to know the attachment id.
+
+    `last_memory_state` exposes structured memory (e.g. `selectedProductId`)
+    so tools like `get_product_image` can resolve "share an image of it" from
+    prior turns without needing the LLM to remember the id.
     """
     last_attachments = list(last_attachments or [])
+    last_memory_state = dict(last_memory_state or {})
 
     def handle_get_catalog(db: Session, **kwargs) -> str:
         return catalog.get_products_formatted(db)
@@ -119,6 +125,23 @@ def build_customer_tools(
             db,
             attachment_id=int(attachment_id),
         )
+
+    def handle_get_product_image(db: Session, **kwargs) -> list[dict]:
+        product_id = kwargs.get("product_id")
+        if product_id is None:
+            product_id = last_memory_state.get("selectedProductId")
+        if product_id is None:
+            candidates = last_memory_state.get("lastProductCandidates") or []
+            if isinstance(candidates, list) and candidates:
+                first = candidates[0] if isinstance(candidates[0], dict) else {}
+                product_id = first.get("product_id")
+        if product_id is None:
+            return []
+        try:
+            pid = int(product_id)
+        except (TypeError, ValueError):
+            return []
+        return product_image_search.get_product_card(db, product_id=pid)
 
     def handle_create_order(db: Session, **kwargs) -> dict:
         delivery_location = str(kwargs.get("delivery_location", "")).strip()
@@ -205,6 +228,27 @@ def build_customer_tools(
                 "required": [],
             },
             handler=handle_find_products_by_image,
+        ),
+        _tool(
+            name="get_product_image",
+            description=(
+                "Returns the catalog card for a specific product (image, name, "
+                "price, variants). Use when the user asks to see, share, or send "
+                "a photo of a product they have already discussed (e.g. 'share an "
+                "image', 'send me a photo'). If no product_id is provided, the "
+                "most recently selected product from memory is used."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "product_id": {
+                        "type": "integer",
+                        "description": "Optional. Defaults to memory.selectedProductId.",
+                    },
+                },
+                "required": [],
+            },
+            handler=handle_get_product_image,
         ),
         _tool(
             name="create_order",

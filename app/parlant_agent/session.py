@@ -60,8 +60,17 @@ class AfrisaleSession:
             if is_customer
             else guidelines_module.owner_guidelines()
         )
+        memory_state = conversation_state_service.get_state(db, self.customer_id)
+        if attachments:
+            memory_state["lastInboundAttachments"] = list(attachments)
+
         tools = (
-            tool_registry_module.build_customer_tools(db, self.customer_id, last_attachments=attachments)
+            tool_registry_module.build_customer_tools(
+                db,
+                self.customer_id,
+                last_attachments=attachments,
+                last_memory_state=memory_state,
+            )
             if is_customer
             else tool_registry_module.build_owner_tools(db, last_attachments=attachments)
         )
@@ -71,9 +80,6 @@ class AfrisaleSession:
             {"direction": m.direction, "message": m.message}
             for m in recent_rows
         ]
-        memory_state = conversation_state_service.get_state(db, self.customer_id)
-        if attachments:
-            memory_state["lastInboundAttachments"] = list(attachments)
 
         tools = _db_bound_tools(tools, db)
         engine = engine_module.build_engine(self.role, tools, guidelines)
@@ -114,13 +120,16 @@ class AfrisaleSession:
         db: Session,
         user_text: str,
         attachments: list[dict[str, Any]] | None = None,
-    ) -> tuple[str, str, str, list[dict[str, Any]]]:
+    ) -> dict[str, Any]:
         """
-        Runs a turn with optional inbound media context and returns:
-            (reply_text, media_url, alternates_text, matches)
-
-        media_url is the public URL of the top match's primary image (if any),
-        and alternates_text is a follow-up text listing other matches.
+        Runs a turn with optional inbound media context and returns a dict:
+            {
+              "reply": str,            # caption when media is present, else free-form reply
+              "media_url": str,        # public https URL of top match's image (empty if none)
+              "media_gcs_uri": str,    # gs:// URI for signing at dispatch time
+              "alternates_text": str,  # follow-up text listing additional matches
+              "matches": list,         # full match dicts
+            }
         """
         try:
             engine = await self._build_engine_with_context(db, attachments=attachments)
@@ -135,22 +144,38 @@ class AfrisaleSession:
                 raise RuntimeError("Engine does not expose an async run method.")
             reply = str(out or "")
             media_url = ""
+            media_gcs_uri = ""
+            caption = ""
             alternates = ""
             matches: list[dict[str, Any]] = []
             if hasattr(engine, "consume_media_artifacts"):
                 artifacts = engine.consume_media_artifacts()
                 media_url = str(artifacts.get("media_url", "") or "")
+                media_gcs_uri = str(artifacts.get("media_gcs_uri", "") or "")
+                caption = str(artifacts.get("caption", "") or "")
                 alternates = str(artifacts.get("alternates_text", "") or "")
                 matches = list(artifacts.get("matches") or [])
-            return reply, media_url, alternates, matches
+            # When a media card will be sent we prefer the deterministic
+            # caption over the LLM prose; this guarantees the card always
+            # shows name, price, and variants in a stable layout.
+            if media_url and caption:
+                reply = caption
+            return {
+                "reply": reply,
+                "media_url": media_url,
+                "media_gcs_uri": media_gcs_uri,
+                "alternates_text": alternates,
+                "matches": matches,
+            }
         except Exception:
             logger.exception("AfrisaleSession media turn failed")
-            return (
-                "I'm having trouble right now. Please try again shortly.",
-                "",
-                "",
-                [],
-            )
+            return {
+                "reply": "I'm having trouble right now. Please try again shortly.",
+                "media_url": "",
+                "media_gcs_uri": "",
+                "alternates_text": "",
+                "matches": [],
+            }
 
 
 setattr(AfrisaleSession, "run" + "_turn", AfrisaleSession.run)

@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.integrations import africastalking, twilio_whatsapp
+from app.integrations import africastalking, gcs, twilio_whatsapp
 from app.models.models import Customer, Message
 from app.parlant_agent.session import AfrisaleSession
 from app.services import media_service, message_service
@@ -22,13 +22,17 @@ class OutboundEnvelope:
     """
     Result of an agent turn that the dispatch stage knows how to send.
 
-    `text` is the primary message body. `media_url` is the public URL of the
-    top-match product image (if any). `alternates_text` is an optional second
-    text-only message listing additional matches.
+    `text` is the primary message body (or the caption when media is sent).
+    `media_url` is the public https URL of the top-match product image.
+    `media_gcs_uri` is the gs:// URI; dispatch may sign this when the bucket
+    is private so Twilio's anonymous fetcher can read it.
+    `alternates_text` is an optional second text-only message listing more
+    matches.
     """
 
     text: str
     media_url: str = ""
+    media_gcs_uri: str = ""
     alternates_text: str = ""
     matches: list[dict[str, Any]] = field(default_factory=list)
 
@@ -108,16 +112,17 @@ async def call_agent(
     via shared memory; we read them back here.
     """
     session = AfrisaleSession(customer_id=customer.id, role=role)
-    reply, media_url, alternates, matches = await session.run_turn_with_media(
+    result = await session.run_turn_with_media(
         db,
         user_text=text,
         attachments=attachments or [],
     )
     return OutboundEnvelope(
-        text=str(reply or ""),
-        media_url=str(media_url or ""),
-        alternates_text=str(alternates or ""),
-        matches=list(matches or []),
+        text=str(result.get("reply") or ""),
+        media_url=str(result.get("media_url") or ""),
+        media_gcs_uri=str(result.get("media_gcs_uri") or ""),
+        alternates_text=str(result.get("alternates_text") or ""),
+        matches=list(result.get("matches") or []),
     )
 
 
@@ -141,6 +146,38 @@ async def persist_outbound(
     db.commit()
 
 
+def _public_url_to_gs_uri(url: str) -> str:
+    """Best-effort reverse of `gcs.public_https_url` so we can sign on demand."""
+    if not url:
+        return ""
+    prefix = "https://storage.googleapis.com/"
+    if not url.startswith(prefix):
+        return ""
+    rest = url[len(prefix):]
+    if "/" not in rest:
+        return ""
+    bucket, obj = rest.split("/", 1)
+    return f"gs://{bucket}/{obj}"
+
+
+def _twilio_safe_media_url(envelope: OutboundEnvelope) -> str:
+    """
+    Twilio's WhatsApp media fetcher is anonymous, so a private GCS bucket
+    will return 403 on a plain `https://storage.googleapis.com/...` URL.
+    Whenever we have a `gs://` URI, generate a v4 signed URL so the fetch
+    succeeds regardless of bucket ACLs.
+    """
+    gs_uri = (envelope.media_gcs_uri or "").strip()
+    if not gs_uri:
+        gs_uri = _public_url_to_gs_uri(envelope.media_url or "")
+    if gs_uri:
+        try:
+            return gcs.signed_url(gs_uri)
+        except Exception:
+            logger.exception("signed_url_failed_falling_back_to_public uri=%s", gs_uri)
+    return envelope.media_url or ""
+
+
 async def dispatch_outbound(
     to: str,
     envelope: OutboundEnvelope,
@@ -151,7 +188,8 @@ async def dispatch_outbound(
 
     For WhatsApp, when an image url is present we send the top match as a
     media message (image + caption), then optionally send the alternates as
-    a follow-up text message.
+    a follow-up text message. GCS URLs are signed on the fly so Twilio's
+    anonymous media fetcher can read them even when the bucket is private.
 
     For SMS (no outbound_send), media is dropped to text only.
     """
@@ -164,15 +202,18 @@ async def dispatch_outbound(
             africastalking.send_sms(to_e164, body)
             return
 
-        if envelope.media_url:
-            twilio_whatsapp.send_whatsapp_media(
-                to_e164,
-                envelope.text,
-                envelope.media_url,
-            )
-            if envelope.alternates_text.strip():
-                twilio_whatsapp.send_whatsapp(to_e164, envelope.alternates_text.strip())
-            return
+        if envelope.media_url or envelope.media_gcs_uri:
+            send_url = _twilio_safe_media_url(envelope)
+            if send_url:
+                twilio_whatsapp.send_whatsapp_media(
+                    to_e164,
+                    envelope.text,
+                    send_url,
+                )
+                if envelope.alternates_text.strip():
+                    twilio_whatsapp.send_whatsapp(to_e164, envelope.alternates_text.strip())
+                return
+            # Could not produce a usable media URL; fall through to text-only.
 
         result = outbound_send(to_e164, envelope.text)
         if inspect.isawaitable(result):

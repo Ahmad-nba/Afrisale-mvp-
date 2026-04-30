@@ -259,8 +259,58 @@ class LocalParlantEngine:
                 first_variant = variants[0] if isinstance(variants[0], dict) else {}
                 price_val = first_variant.get("price")
                 if isinstance(price_val, (int, float)) and price_val:
-                    price_str = f" - {int(price_val)}"
+                    price_str = f" - {int(price_val):,}"
             lines.append(f"- {name}{price_str}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_caption(top: dict[str, Any]) -> str:
+        """
+        Deterministic caption shown alongside a WhatsApp media card.
+        Format: "<Name> — <price>\n<size/color summary>\n<short description>".
+        Capped to 1024 chars (Twilio caption limit) by output_formatting later.
+        """
+        if not isinstance(top, dict):
+            return ""
+        name = str(top.get("name", "")).strip() or "Product"
+        variants = top.get("variants") or []
+        price_val: int | None = None
+        if variants:
+            first = variants[0] if isinstance(variants[0], dict) else {}
+            raw_price = first.get("price")
+            if isinstance(raw_price, (int, float)) and raw_price:
+                price_val = int(raw_price)
+
+        header = name
+        if price_val is not None:
+            header = f"{name} - {price_val:,}"
+
+        variant_summary = ""
+        if variants:
+            parts: list[str] = []
+            for v in variants[:3]:
+                if not isinstance(v, dict):
+                    continue
+                size = str(v.get("size", "")).strip()
+                color = str(v.get("color", "")).strip()
+                stock = v.get("stock_quantity")
+                pieces = "/".join([p for p in (size, color) if p])
+                if stock is not None and isinstance(stock, (int, float)):
+                    pieces = f"{pieces} (stock {int(stock)})" if pieces else f"stock {int(stock)}"
+                if pieces:
+                    parts.append(pieces)
+            if parts:
+                variant_summary = "Variants: " + ", ".join(parts)
+
+        description = str(top.get("description", "") or "").strip()
+        if len(description) > 200:
+            description = description[:197].rstrip() + "…"
+
+        lines = [header]
+        if variant_summary:
+            lines.append(variant_summary)
+        if description:
+            lines.append(description)
         return "\n".join(lines)
 
     def _has_inbound_image(self) -> bool:
@@ -268,6 +318,37 @@ class LocalParlantEngine:
             isinstance(a, dict) and str(a.get("kind", "")).lower() == "image"
             for a in (self.attachments or [])
         )
+
+    @staticmethod
+    def _is_image_request(text: str) -> bool:
+        """Heuristic: user asked to see/share/send an image of a product."""
+        t = (text or "").lower().strip()
+        if not t:
+            return False
+        keywords = (
+            "share an image",
+            "share image",
+            "share a photo",
+            "share photo",
+            "send an image",
+            "send image",
+            "send a photo",
+            "send photo",
+            "send me a photo",
+            "send me an image",
+            "show me a photo",
+            "show me an image",
+            "show me the image",
+            "show me the photo",
+            "show the image",
+            "picture of it",
+            "picture of the",
+            "photo of it",
+            "photo of the",
+            "image of it",
+            "image of the",
+        )
+        return any(k in t for k in keywords)
 
     async def run(self, user_text: str) -> str:
         tools = self._tool_map()
@@ -281,6 +362,7 @@ class LocalParlantEngine:
         self._persist_state(state)
 
         has_image = self._has_inbound_image()
+        wants_image = self._is_image_request(user_text)
         planner_prompt = (
             self._build_prompt(user_text)
             + "\n\nDecide whether a tool call is needed.\n"
@@ -288,6 +370,7 @@ class LocalParlantEngine:
             + '{"tool": "<tool_name_or_null>", "args": {}}'
             + "\nRules:\n"
             + "- If the inbound message has an image attachment, you MUST use find_products_by_image (no args needed; latest image is used).\n"
+            + "- If the user asks to see, share, or send an image/photo of a product they have already discussed, use get_product_image (no args needed; selectedProductId from memory is used).\n"
             + "- If user is searching for products by description, prefer search_products.\n"
             + "- For descriptive product queries (brand, color, material), prefer find_products_by_text.\n"
             + "- If user asks for full listing, use get_catalog.\n"
@@ -302,6 +385,11 @@ class LocalParlantEngine:
         # image-search tool. Planner sometimes drifts even with rules above.
         if has_image and "find_products_by_image" in tools:
             selected_tool = "find_products_by_image"
+            args = {}
+        # Hard override: explicit "share an image" intent without an attachment
+        # routes to get_product_image so we surface a fresh media card.
+        elif wants_image and "get_product_image" in tools:
+            selected_tool = "get_product_image"
             args = {}
 
         if isinstance(selected_tool, str) and selected_tool == "search_products":
@@ -342,6 +430,7 @@ class LocalParlantEngine:
                 if selected_tool in (
                     "find_products_by_image",
                     "find_products_by_text",
+                    "get_product_image",
                     "search_products",
                 ) and isinstance(tool_result, list):
                     captured_matches = [m for m in tool_result if isinstance(m, dict)]
@@ -390,15 +479,25 @@ class LocalParlantEngine:
         Persist a `media_url` for the top match (if it has an image) plus a
         short alternates text so the dispatch stage can render a WhatsApp
         media card + follow-up text.
+
+        Also produces a deterministic `caption` (name + price + variants +
+        short description) so the card always renders consistently regardless
+        of what the LLM wrote.
         """
         if not matches:
             self._media_artifacts = {}
             return
         top = matches[0] if isinstance(matches[0], dict) else {}
         media_url = str(top.get("image_url") or "")
+        if not media_url:
+            self._media_artifacts = {}
+            return
+        caption = self._build_caption(top)
         alternates = self._format_alternates(matches[1:4])
         self._media_artifacts = {
             "media_url": media_url,
+            "media_gcs_uri": str(top.get("image_gcs_uri") or ""),
+            "caption": caption,
             "alternates_text": alternates,
             "matches": matches,
         }

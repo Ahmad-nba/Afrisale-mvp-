@@ -183,3 +183,67 @@ def search_by_text(
         logger.exception("image_search embed_text_failed query=%s", text[:80])
         return []
     return search_by_vector(db, vector=vector, top_k=top_k, mode="text")
+
+
+def get_product_card(db: Session, product_id: int) -> list[dict[str, Any]]:
+    """
+    Returns a 1-item list containing the canonical "match card" for a product:
+    primary image (or first image), product name, description, variants.
+
+    Used for follow-up turns like "share an image" where the user already
+    knows which product they want — no embedding/search needed.
+    """
+    pid = int(product_id)
+    image = db.scalars(
+        select(ProductImage)
+        .where(ProductImage.product_id == pid)
+        .where(ProductImage.is_primary.is_(True))
+    ).first()
+    if not image:
+        image = db.scalars(
+            select(ProductImage)
+            .where(ProductImage.product_id == pid)
+            .order_by(ProductImage.id)
+        ).first()
+    if not image:
+        return []
+
+    product = db.get(Product, pid)
+    if not product:
+        return []
+
+    variants = db.scalars(
+        select(ProductVariant)
+        .where(ProductVariant.product_id == product.id)
+        .order_by(ProductVariant.id)
+    ).all()
+    variant_payload = [
+        {
+            "variant_id": v.id,
+            "size": v.size,
+            "color": v.color,
+            "price": int(v.price or 0),
+            "stock_quantity": int(v.stock_quantity or 0),
+        }
+        for v in variants
+    ]
+
+    public_url = image.public_url
+    if not public_url and image.gcs_uri:
+        try:
+            public_url = gcs.public_https_url(image.gcs_uri)
+        except Exception:
+            public_url = ""
+
+    return [
+        {
+            "product_id": int(product.id),
+            "name": product.name,
+            "description": product.description or "",
+            "image_url": public_url,
+            "image_gcs_uri": image.gcs_uri,
+            "variants": variant_payload,
+            "similarity": 1.0,
+            "distance": 0.0,
+        }
+    ]
