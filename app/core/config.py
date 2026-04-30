@@ -40,7 +40,13 @@ class Settings(BaseSettings):
     image_max_bytes: int = 10 * 1024 * 1024
     image_allowed_mimes: str = "image/jpeg,image/png,image/webp,image/heic,image/heif"
 
-    image_match_min_similarity: float = 0.55
+    # Cross-modal cosine (text query -> image vector) is systematically lower
+    # than image-to-image cosine in this multimodal embedding model, so we
+    # use two thresholds. Tune empirically; defaults below are calibrated
+    # against the seeded MVP catalog.
+    image_match_min_similarity: float = 0.30  # legacy/default; image-mode threshold
+    image_match_min_similarity_image: float = 0.30
+    image_match_min_similarity_text: float = 0.06
     image_match_top_k: int = 4
 
 

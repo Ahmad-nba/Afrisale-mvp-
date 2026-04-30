@@ -6,11 +6,13 @@ Single source of truth for "register a new catalog image" used by both:
 Steps performed for each image:
   1. Upload original bytes to GCS under `catalog/<product_id>/<uuid>.<ext>`.
   2. Embed with Vertex AI multimodal embeddings (1408-dim).
-  3. Upsert the vector into Vertex AI Vector Search.
-  4. Persist a `ProductImage` row with the GCS URI and vector datapoint id.
+  3. Persist a `ProductImage` row with the GCS URI, a unique datapoint id,
+     and the embedding JSON-encoded into `embedding_json`. Local cosine
+     search reads this column directly at query time.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
@@ -41,6 +43,17 @@ def _object_name(product_id: int, mime: str) -> str:
     return f"catalog/{int(product_id)}/{int(time.time())}_{uuid.uuid4().hex}{_ext_from_mime(mime)}"
 
 
+def _resolve_is_primary(db: Session, product_id: int, requested: Optional[bool]) -> bool:
+    if requested is not None:
+        return bool(requested)
+    existing_primary = db.scalars(
+        select(ProductImage)
+        .where(ProductImage.product_id == product_id)
+        .where(ProductImage.is_primary.is_(True))
+    ).first()
+    return existing_primary is None
+
+
 def register_product_image(
     db: Session,
     product_id: int,
@@ -62,36 +75,25 @@ def register_product_image(
 
     vector = embeddings.embed_image_gcs(gcs_uri)
     datapoint_id = vector_search.new_datapoint_id(prefix=f"prod{product.id}")
-    vector_search.upsert_datapoint(
-        datapoint_id=datapoint_id,
-        vector=vector,
-        restricts=[{"namespace": "kind", "allow_list": ["product_image"]}],
-    )
-
-    if is_primary is None:
-        existing_primary = db.scalars(
-            select(ProductImage)
-            .where(ProductImage.product_id == product.id)
-            .where(ProductImage.is_primary.is_(True))
-        ).first()
-        is_primary = existing_primary is None
 
     image = ProductImage(
         product_id=product.id,
         gcs_uri=gcs_uri,
         public_url=public_url,
         mime_type=mime_type or "image/jpeg",
-        is_primary=bool(is_primary),
+        is_primary=_resolve_is_primary(db, product.id, is_primary),
         vector_datapoint_id=datapoint_id,
+        embedding_json=json.dumps([float(v) for v in vector]),
     )
     db.add(image)
     db.commit()
     db.refresh(image)
     logger.info(
-        "catalog_image_registered product_id=%s image_id=%s datapoint=%s",
+        "catalog_image_registered product_id=%s image_id=%s datapoint=%s dim=%d",
         product.id,
         image.id,
         datapoint_id,
+        len(vector),
     )
     return image
 
@@ -119,34 +121,23 @@ def register_product_image_from_attachment(
 
     vector = embeddings.embed_image_gcs(attachment.gcs_uri)
     datapoint_id = vector_search.new_datapoint_id(prefix=f"prod{product.id}")
-    vector_search.upsert_datapoint(
-        datapoint_id=datapoint_id,
-        vector=vector,
-        restricts=[{"namespace": "kind", "allow_list": ["product_image"]}],
-    )
-
-    if is_primary is None:
-        existing_primary = db.scalars(
-            select(ProductImage)
-            .where(ProductImage.product_id == product.id)
-            .where(ProductImage.is_primary.is_(True))
-        ).first()
-        is_primary = existing_primary is None
 
     image = ProductImage(
         product_id=product.id,
         gcs_uri=attachment.gcs_uri,
         public_url=attachment.public_url or "",
         mime_type=attachment.mime_type or "image/jpeg",
-        is_primary=bool(is_primary),
+        is_primary=_resolve_is_primary(db, product.id, is_primary),
         vector_datapoint_id=datapoint_id,
+        embedding_json=json.dumps([float(v) for v in vector]),
     )
     db.add(image)
     db.commit()
     db.refresh(image)
     logger.info(
-        "catalog_image_registered_from_attachment product_id=%s image_id=%s",
+        "catalog_image_registered_from_attachment product_id=%s image_id=%s dim=%d",
         product.id,
         image.id,
+        len(vector),
     )
     return image

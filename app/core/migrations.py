@@ -23,6 +23,9 @@ _REQUIRED_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("channel", "VARCHAR(16) NOT NULL DEFAULT 'whatsapp'"),
         ("message_type", "VARCHAR(16) NOT NULL DEFAULT 'text'"),
     ],
+    "product_images": [
+        ("embedding_json", "TEXT NOT NULL DEFAULT ''"),
+    ],
 }
 
 

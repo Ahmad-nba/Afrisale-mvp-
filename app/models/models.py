@@ -40,6 +40,9 @@ class ProductImage(Base):
     mime_type: Mapped[str] = mapped_column(String(64), nullable=False, default="image/jpeg")
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     vector_datapoint_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # JSON-encoded list of floats (1408-dim multimodal embedding). Empty for
+    # legacy rows; used by the local cosine-similarity search path.
+    embedding_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     product: Mapped["Product"] = relationship(back_populates="images")

@@ -1,9 +1,10 @@
 """
 High-level catalog matching by image or by text.
 
-Both flows embed the query into the same multimodal vector space, query
-Vertex AI Vector Search for nearest neighbors, then resolve neighbor IDs
-to `ProductImage -> Product -> ProductVariant` rows.
+Both flows embed the query into the same multimodal vector space, run a
+local NumPy cosine-similarity scan over `product_images.embedding_json`,
+then resolve neighbor IDs to `ProductImage -> Product -> ProductVariant`
+rows.
 
 Returns a list of structured matches the agent (and the outbound dispatch
 stage) can consume to compose WhatsApp media cards.
@@ -82,21 +83,40 @@ def _dedupe_top_per_product(matches: list[dict[str, Any]]) -> list[dict[str, Any
     return out
 
 
-def _filter_by_threshold(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    threshold = float(settings.image_match_min_similarity or 0.0)
+def _filter_by_threshold(
+    matches: list[dict[str, Any]], threshold: float
+) -> list[dict[str, Any]]:
     if threshold <= 0:
         return matches
     return [m for m in matches if float(m.get("similarity", 0.0)) >= threshold]
+
+
+def _default_threshold(mode: str) -> float:
+    """Pick a mode-appropriate cosine threshold.
+
+    Cross-modal (text query -> image embedding) cosines are systematically
+    smaller than intra-modal (image -> image) cosines in this multimodal
+    embedding model, so we expose two settings.
+    """
+    if mode == "text":
+        return float(settings.image_match_min_similarity_text or 0.0)
+    return float(
+        settings.image_match_min_similarity_image
+        or settings.image_match_min_similarity
+        or 0.0
+    )
 
 
 def search_by_vector(
     db: Session,
     vector: list[float],
     top_k: Optional[int] = None,
+    min_similarity: Optional[float] = None,
+    mode: str = "image",
 ) -> list[dict[str, Any]]:
     k = int(top_k or settings.image_match_top_k or 4)
     fetch_k = max(k * 2, 6)
-    neighbors = vector_search.find_neighbors(vector=vector, top_k=fetch_k)
+    neighbors = vector_search.find_neighbors(vector=vector, top_k=fetch_k, db=db)
     matches: list[dict[str, Any]] = []
     for neighbor in neighbors:
         resolved = _resolve_match(
@@ -108,7 +128,10 @@ def search_by_vector(
         if resolved:
             matches.append(resolved)
     matches = _dedupe_top_per_product(matches)
-    matches = _filter_by_threshold(matches)
+    threshold = (
+        float(min_similarity) if min_similarity is not None else _default_threshold(mode)
+    )
+    matches = _filter_by_threshold(matches, threshold)
     return matches[:k]
 
 
@@ -129,7 +152,7 @@ def search_by_image_attachment(
     except Exception:
         logger.exception("image_search embed_failed id=%s", attachment_id)
         return []
-    return search_by_vector(db, vector=vector, top_k=top_k)
+    return search_by_vector(db, vector=vector, top_k=top_k, mode="image")
 
 
 def search_by_image_bytes(
@@ -143,7 +166,7 @@ def search_by_image_bytes(
     except Exception:
         logger.exception("image_search embed_bytes_failed")
         return []
-    return search_by_vector(db, vector=vector, top_k=top_k)
+    return search_by_vector(db, vector=vector, top_k=top_k, mode="image")
 
 
 def search_by_text(
@@ -159,4 +182,4 @@ def search_by_text(
     except Exception:
         logger.exception("image_search embed_text_failed query=%s", text[:80])
         return []
-    return search_by_vector(db, vector=vector, top_k=top_k)
+    return search_by_vector(db, vector=vector, top_k=top_k, mode="text")
