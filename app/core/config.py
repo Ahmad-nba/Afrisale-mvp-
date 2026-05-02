@@ -49,5 +49,11 @@ class Settings(BaseSettings):
     image_match_min_similarity_text: float = 0.06
     image_match_top_k: int = 4
 
+    # Seller MVP — the seller web pages share a single bearer token, and the
+    # agent embeds it into the URLs it sends to the seller's WhatsApp.
+    seller_access_token: str = ""
+    seller_base_url: str = "http://localhost:3000"
+    seller_notification_window_seconds: int = 300
+
 
 settings = Settings()

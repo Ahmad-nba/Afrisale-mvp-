@@ -21,6 +21,16 @@ def create_order(db: Session, customer_id: int, product_variant_id: int, quantit
     db.add(item)
     v.stock_quantity -= quantity
     db.commit()
+    # Best-effort enqueue for the seller batched-notification loop. Imported
+    # lazily to avoid a circular import with the notification module which
+    # itself imports from app.models.
+    try:
+        from app.services import seller_notification
+
+        seller_notification.queue_order_notification(db, order.id)
+    except Exception:
+        # Notification is non-critical; never break order creation on failure.
+        pass
     return f"Order created: id={order.id}, total={line_total}, status=pending."
 
 

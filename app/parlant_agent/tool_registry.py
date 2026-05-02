@@ -1,5 +1,7 @@
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
+from app.models.models import Customer
 from app.services import catalog, catalog_image_ingest, orders, product_image_search
 
 
@@ -174,6 +176,19 @@ def build_customer_tools(
         order_id = int(kwargs["order_id"])
         return orders.check_order_status(db, customer_id=customer_id, order_id=order_id)
 
+    def handle_set_customer_name(db: Session, **kwargs) -> str:
+        name = str(kwargs.get("name", "")).strip()
+        if not name:
+            raise ValueError("Name cannot be empty.")
+        if len(name) > 128:
+            name = name[:128]
+        customer = db.get(Customer, customer_id)
+        if not customer:
+            return "Could not save name: customer not found."
+        customer.name = name
+        db.commit()
+        return f"Saved buyer name: {name}."
+
     return [
         _tool(
             name="get_catalog",
@@ -287,6 +302,26 @@ def build_customer_tools(
             },
             handler=handle_get_order_status,
         ),
+        _tool(
+            name="set_customer_name",
+            description=(
+                "Saves the buyer's display name. Call this BEFORE create_order "
+                "the first time a customer asks to place an order, so the "
+                "seller's orders view shows a real name instead of just a phone "
+                "number. Skip if the customer's name is already on record."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Customer's display name (max 128 chars).",
+                    },
+                },
+                "required": ["name"],
+            },
+            handler=handle_set_customer_name,
+        ),
     ]
 
 
@@ -323,6 +358,29 @@ def build_owner_tools(
 
     def handle_list_all_orders(db: Session, **kwargs) -> str:
         return orders.view_orders(db)
+
+    def _build_seller_link(path: str) -> str:
+        base = (settings.seller_base_url or "").rstrip("/")
+        token = settings.seller_access_token or ""
+        if not base:
+            return (
+                "Seller dashboard URL is not configured. Set SELLER_BASE_URL "
+                "in the environment."
+            )
+        suffix = f"?t={token}" if token else ""
+        return f"{base}{path}{suffix}"
+
+    def handle_share_upload_link(db: Session, **kwargs) -> str:
+        url = _build_seller_link("/seller/upload")
+        return f"Upload products here: {url}"
+
+    def handle_share_catalogue_link(db: Session, **kwargs) -> str:
+        url = _build_seller_link("/seller/catalogue")
+        return f"Your catalogue: {url}"
+
+    def handle_share_orders_link(db: Session, **kwargs) -> str:
+        url = _build_seller_link("/seller/orders")
+        return f"View orders: {url}"
 
     def handle_add_product_image(db: Session, **kwargs) -> str:
         product_id = int(kwargs["product_id"])
@@ -415,5 +473,34 @@ def build_owner_tools(
                 "required": ["product_id"],
             },
             handler=handle_add_product_image,
+        ),
+        _tool(
+            name="share_upload_link",
+            description=(
+                "Replies with the seller's personalised /seller/upload URL. "
+                "Use whenever the seller wants to upload, add, or onboard "
+                "products in bulk (anything beyond a one-line text edit)."
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=handle_share_upload_link,
+        ),
+        _tool(
+            name="share_catalogue_link",
+            description=(
+                "Replies with the seller's personalised /seller/catalogue URL. "
+                "Use whenever the seller asks to see, browse, or review their "
+                "current catalogue / inventory."
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=handle_share_catalogue_link,
+        ),
+        _tool(
+            name="share_orders_link",
+            description=(
+                "Replies with the seller's personalised /seller/orders URL. "
+                "Use whenever the seller asks to see, view, or check orders."
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            handler=handle_share_orders_link,
         ),
     ]

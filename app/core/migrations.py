@@ -26,6 +26,9 @@ _REQUIRED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "product_images": [
         ("embedding_json", "TEXT NOT NULL DEFAULT ''"),
     ],
+    "customers": [
+        ("name", "VARCHAR(128) NOT NULL DEFAULT ''"),
+    ],
 }
 
 

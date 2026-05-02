@@ -53,6 +53,9 @@ class Customer(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     phone_number: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)
+    # Display name captured during the order flow (agent asks before create_order).
+    # Empty string for anonymous customers; the seller orders view falls back to phone.
+    name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
 
     messages: Mapped[list["Message"]] = relationship(back_populates="customer")
     orders: Mapped[list["Order"]] = relationship(back_populates="customer")
@@ -137,3 +140,19 @@ class ConversationState(Base):
     state_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
 
     customer: Mapped["Customer"] = relationship(back_populates="conversation_state")
+
+
+class PendingSellerNotification(Base):
+    """
+    DB-backed queue of order events that still need to be batched and sent
+    to the seller. The flush loop wakes every SELLER_NOTIFICATION_WINDOW_SECONDS,
+    coalesces undelivered rows into one WhatsApp message, and stamps
+    `delivered_at` on success.
+    """
+
+    __tablename__ = "pending_seller_notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
